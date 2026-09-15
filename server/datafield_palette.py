@@ -661,6 +661,25 @@ def vector_field_names() -> set[str]:
     return names
 
 
+def group_field_names() -> frozenset:
+    """Known classification fields, cached with the source catalog mtime."""
+    paths = (_LIVE_CSV_PATH, DATAFIELDS_CSV)
+    stamps = tuple((p, os.path.getmtime(p) if os.path.exists(p) else None) for p in paths)
+    key = ('group_types', stamps)
+    with _POOL_LOCK:
+        if key in _POOL_CACHE:
+            return _POOL_CACHE[key]
+    names = frozenset(str(r.get('name') or '').strip().lower()
+                      for r in _all_rows()
+                      if str(r.get('type') or '').strip().lower() == 'group') - {''}
+    with _POOL_LOCK:
+        for old in list(_POOL_CACHE):
+            if isinstance(old, tuple) and old[0] == 'group_types':
+                _POOL_CACHE.pop(old, None)
+        _POOL_CACHE[key] = names
+    return names
+
+
 def _apply_region_filter(rows: list[dict], region: str) -> list[dict]:
     region_lc = region.lower()
     return [r for r in rows if r.get('region', '').lower() == region_lc]

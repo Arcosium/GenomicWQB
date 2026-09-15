@@ -1165,6 +1165,8 @@ class WqbApiClient:
         않고 Retry-After(없으면 지수 백오프)를 존중하며 deadline 안에서 재시도한다.
         stop_event 가 set 되면 폴링/재시도를 즉시 중단한다 (pause 반응성).
         """
+        self._last_submit_alpha_id = alpha_id
+        self._last_submit_checks = []
         if not alpha_id:
             return False, 'submit_error:missing_alpha_id'
         if not self._ensure_auth():
@@ -1218,6 +1220,8 @@ class WqbApiClient:
                 except Exception:
                     body = None
                 reason = self._rejection_reason(body)
+                from .submission_feedback import compact_checks
+                self._last_submit_checks = compact_checks(body)
                 if reason:
                     return False, f'rejected:{reason}'
                 return True, 'submitted'
@@ -1241,6 +1245,8 @@ class WqbApiClient:
                 body_j = r.json()
             except Exception:
                 body_j = None
+            from .submission_feedback import compact_checks
+            self._last_submit_checks = compact_checks(body_j)
             # 거절 응답은 하루 4건뿐이라 통째로 남겨도 로그가 붐비지 않는다. 이름만
             # 저장하면 나중에 왜 거절됐는지 재구성할 길이 없다(위 _rejection_reason 참조).
             if r.status_code not in (404,):

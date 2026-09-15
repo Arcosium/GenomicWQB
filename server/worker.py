@@ -1459,6 +1459,7 @@ class Worker(threading.Thread):
                 seeds = seeds[:5]
         seed_genomes: list[dict] = []
         seed_alpha_ids: list[int | None] = []
+        seed_metrics: list[dict] = []
         _dropped_seeds = 0
         for sd in seeds:
             if isinstance(sd.get('genome'), dict):
@@ -1472,6 +1473,10 @@ class Worker(threading.Thread):
                 seed_genomes.append(sd['genome'])
                 # 시드의 alphas.id — 이 시드에서 나온 자식의 parent_alpha_id 귀속용.
                 seed_alpha_ids.append(sd.get('id'))
+                from .submission_feedback import observations
+                _seed_m = dict(sd.get('metrics') or {})
+                _seed_m['_submit_checks'] = observations(sd)
+                seed_metrics.append(_seed_m)
         if _dropped_seeds:
             self._log(round_num,
                       f'  ⚠ 조건과 안 맞는 시드 {_dropped_seeds}개 제외 '
@@ -1637,6 +1642,7 @@ class Worker(threading.Thread):
                 parent_alpha_id=((focus_entry or {}).get('parent_alpha_id')
                                  if is_focus else None),
                 seed_alpha_ids=seed_alpha_ids,
+                seed_metrics=seed_metrics,
                 directive_stats=_dstats,
                 spec_genomes=[s['genome'] for s in pending_specs] or None,
                 spec_ids=[s['id'] for s in pending_specs] or None,
@@ -1653,7 +1659,7 @@ class Worker(threading.Thread):
                       f'  세대 구성 — '
                       + (f'전략스펙 {_origins.get("spec", 0)} · ' if _origins.get('spec') else '')
                       + f'탐색 {_origins.get("random", 0)} · '
-                      f'국소 {_origins.get("local", 0) + _origins.get("sweep", 0)} · '
+                      f'단일축 {_origins.get("sweep", 0)} · 국소 {_origins.get("local", 0)} · '
                       f'탈출 {_origins.get("escape", 0)} · '
                       f'변이 {_origins.get("mutate", 0)} · 교차 {_origins.get("crossover", 0)}'
                       + (f' (밴딧 arm {min(len(_slot_settings), _origins.get("random", 0))}개 주입)'
@@ -1670,6 +1676,8 @@ class Worker(threading.Thread):
                 if COMBINE_LAYER_N > 0 and not is_focus and not is_spec_round:
                     from . import combine_layer
                     _cpool = _db.combine_pool(self.user_id, region=_creg)
+                    if _v2_enabled:
+                        _cpool = [a for a in _cpool if _v2_policy.focus_allowed(a, _v21_policy)[0]]
                     _ops = self._account_operators(username, password)
                     _ccands = combine_layer.candidates(
                         _cpool, n=COMBINE_LAYER_N, rng=_det_rng, operators=_ops)
@@ -1685,6 +1693,8 @@ class Worker(threading.Thread):
                 if HUNT_LADDER_PER_ROUND > 0 and not is_spec_round:
                     from . import hunt_ladder
                     _hl = _db.hunt_ladder_pool(self.user_id, region=_creg)
+                    if _v2_enabled:
+                        _hl = [a for a in _hl if _v2_policy.focus_allowed(a, _v21_policy)[0]]
                     _added = 0
                     for _t in _hl:
                         if _added >= HUNT_LADDER_PER_ROUND:
@@ -1714,6 +1724,8 @@ class Worker(threading.Thread):
                         and not is_spec_round):
                     from . import improve_layer as _improve
                     _hpool = _db.ht_rescue_pool(self.user_id, region=_creg)
+                    if _v2_enabled:
+                        _hpool = [a for a in _hpool if _v2_policy.focus_allowed(a, _v21_policy)[0]]
                     if _hpool:
                         _hp = _det_rng.choice(_hpool[:10])   # 상위 10 순환
                         _pset = {k: str(_hp[k]) for k in
@@ -1739,9 +1751,12 @@ class Worker(threading.Thread):
                 if (IMPROVE_LAYER_N > 0 and is_focus and phase == 1 and parent_code
                         and _search_mode != 'escape'):
                     from . import improve_layer
-                    _ivars = improve_layer.variants(
+                    from .submission_feedback import bottleneck, STABILITY
+                    _target = bottleneck({'metrics': parent_metrics})
+                    _ivars = ([] if _v2_enabled and _target and _target['name'] in STABILITY
+                              else improve_layer.variants(
                         parent_code, parent_settings, parent_metrics,
-                        n=IMPROVE_LAYER_N, rng=_det_rng)
+                        n=IMPROVE_LAYER_N, rng=_det_rng))
                     for _v in _ivars:
                         _v['parent_alpha_id'] = (focus_entry or {}).get('parent_alpha_id')
                     if _ivars:
@@ -1868,6 +1883,19 @@ class Worker(threading.Thread):
                         except Exception:
                             pass
                     return
+
+            # Known type errors cannot yield a simulation; check every origin
+            # after repairs, including RC and formula-based improvement layers.
+            from .field_types import numeric_input_reason, group_fields
+            _groups = group_fields()
+            _typed = []
+            for _s in strategies:
+                _type_error = numeric_input_reason(_s.get('code', ''), _groups)
+                if _type_error:
+                    self._log(round_num, f'  타입 오류 후보 #{_s.get("idx")} 제외: {_type_error}')
+                else:
+                    _typed.append(_s)
+            strategies = _typed
 
             # 구조적 탈상관 + 복잡도 사전게이트 (Jaccard 유사도 필터 다음 단계).
             # RC는 "생성 후보를 API 백테스트 후 무조건 제출 시도" 정책이 우선이므로
@@ -2804,6 +2832,9 @@ class Worker(threading.Thread):
                             str(it.get('desc') or it.get('name') or '').strip()
                             for it in f_list
                         ]
+                        if _v2_enabled:
+                            from .submission_feedback import failure_descriptions
+                            fail_descs = failure_descriptions(a) or fail_descs
                         if _constraint is not None:
                             fail_descs.extend(_constraint.required_check_reasons(
                                 metrics=a.get('metrics') or {}))
@@ -2830,7 +2861,7 @@ class Worker(threading.Thread):
                                 'parent_desc': str(a.get('desc') or ''),
                                 'fail_desc': fd,
                                 'parent_pass_items': pass_descs[:8],
-                                'parent_fail_items': fail_descs[:4],
+                                'parent_fail_items': fail_descs,
                                 # 부모의 실측 지표 — 고회전(HTVR) 관문 미달은 FAIL 이
                                 # 아니라 WARNING 이라 fail_items 에 안 나타난다. 정향변이가
                                 # 'churn' 축을 고르려면 이 지표가 있어야 한다.

@@ -121,6 +121,9 @@ def screen(candidates, existing_codes=None, opts=None):
     for c in candidates or []:
         code = (c.get('code') or '') if isinstance(c, dict) else ''
         reason = _drop_reason(code, existing, o)
+        if not reason:
+            from . import field_types
+            reason = field_types.numeric_input_reason(code)
         if not reason and field_check and known is not None:
             reason = _field_reason(code, known)
         if not reason and arity_check:

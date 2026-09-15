@@ -184,11 +184,15 @@ def _metric(metrics: dict, key: str):
 
 def _improved(cat: str, parent: dict, child: dict) -> bool | None:
     """그 category 의 표적 지표가 부모 대비 나아졌는가. 잴 수 없으면 None."""
+    if cat == 'stability':
+        from .submission_feedback import stability_improved
+        return stability_improved(parent, child, IMPROVE_EPS)
     spec = _TARGET_METRIC.get(cat)
     if not spec:
         return None
     key, higher_is_better = spec
-    pm, cm = parent.get('metrics') or {}, child.get('metrics') or {}
+    from .submission_feedback import effective_metrics
+    pm, cm = effective_metrics(parent), effective_metrics(child)
     if key == 'min_region_sharpe':
         region_keys = ('glb_amer_sharpe', 'glb_emea_sharpe', 'glb_apac_sharpe')
         p_values = [_metric(pm, k) for k in region_keys]
@@ -231,15 +235,20 @@ def outcome_observations(parent: dict, child: dict) -> list[tuple[str, str, bool
     d = str(child.get('directive') or '').strip()
     if not d:
         return []
-    p_cats = list(dict.fromkeys(categorize(parent.get('fail_items') or [])))
+    from .submission_feedback import failure_descriptions
+    p_cats = list(dict.fromkeys(categorize(
+        failure_descriptions(parent) or parent.get('fail_items') or [])))
     if not p_cats:
         return []
-    c_cats = set(categorize(child.get('fail_items') or []))
+    c_cats = set(categorize(failure_descriptions(child) or child.get('fail_items') or []))
     regressed = int(child.get('pass_count') or 0) < int(parent.get('pass_count') or 0)
     errored = bool(str(child.get('error_text') or '').strip())
     out: list[tuple[str, str, bool]] = []
     for c in p_cats:
         resolved = c not in c_cats
+        if c == 'stability':
+            # Missing/PENDING temporal observations are not an improvement.
+            resolved = str(child.get('submit_status') or '').startswith('submitted')
         improved = _improved(c, parent, child) is True
         out.append((c, d, (resolved or improved) and not regressed and not errored))
     return out

@@ -18,9 +18,11 @@ from typing import Any, Iterable
 
 from . import alpha_ast
 from . import settings_fp
+from . import submission_feedback as feedback
 
 
-POLICY_VERSION = "genomicwqb-2.1.1"
+POLICY_VERSION = "genomicwqb-2.2.0"
+SINGLE_AXIS_SHARE = 0.28
 MAX_DATASET_SHARE = 0.25
 MAX_EXPRESSION_SHARE = 0.30
 MAX_QUARANTINED_SHARE = 0.10
@@ -123,7 +125,7 @@ def _prod_corr(row: dict) -> float | None:
 
 def quality_misses(row: dict) -> list[str]:
     """Stable D1/GLB quality misses used to identify actionable near passes."""
-    metrics = row.get("metrics") or {}
+    metrics = feedback.effective_metrics(row)
     misses: list[str] = []
     checks = (
         ("sharpe", 1.58), ("fitness", 1.0),
@@ -134,11 +136,15 @@ def quality_misses(row: dict) -> list[str]:
         value = _number(metrics.get(key))
         if value is not None and value < floor:
             misses.append(key)
+    for check in feedback.observations(row):
+        key = feedback.METRICS.get(check['name'], check['name'])
+        if check.get('result') in ('FAIL', 'ERROR') and key not in misses:
+            misses.append(key)
     return misses
 
 
 def _is_near_miss(row: dict) -> bool:
-    metrics = row.get("metrics") or {}
+    metrics = feedback.effective_metrics(row)
     sharpe = _number(metrics.get("sharpe"))
     fitness = _number(metrics.get("fitness"))
     return (sharpe is not None and fitness is not None
@@ -155,7 +161,8 @@ def build_lineage_policy(recent: Iterable[dict] | None = None) -> dict[str, Any]
     below the PROD threshold immediately prevents the lineage from being marked.
     """
     stats: dict[str, dict[str, Any]] = {}
-    for row in list(recent or []):
+    recent = list(recent or [])
+    for row in recent:
         key = dataset_key(row)
         st = stats.setdefault(key, {
             "simulated": 0, "strict_is": 0, "near_miss": 0,
@@ -197,9 +204,50 @@ def build_lineage_policy(recent: Iterable[dict] | None = None) -> dict[str, Any]
         "quarantined": sorted(quarantined),
         "near_miss_keys": sorted(near_keys),
         "near_miss_count": sum(stats[k]["near_miss"] for k in near_keys),
+        "stalled_lineages": stalled_lineages(recent),
+        "single_axis_share": SINGLE_AXIS_SHARE,
         "allocation": {"near_miss": 0.45, "exploration": 0.30,
                        "correlation_escape": 0.15, "hypothesis": 0.10},
     }
+
+
+def _lineage_key(row: dict) -> str:
+    return lineage_profile(row.get('code') or row.get('parent_code') or '',
+                           row.get('genome') or row.get('parent_genome') or {})['lineage_key']
+
+
+def stalled_lineages(recent: Iterable[dict]) -> dict[str, str]:
+    """Withhold another focus round after eight comparable failures stop improving.
+
+    Exact fields/operators identify a lineage. Check dates and thresholds must
+    match; unrelated datasets and changing test windows do not share evidence.
+    A successful submission or a two-point reduction in normalized deficit
+    restores eligibility. This only allocates future research work.
+    """
+    groups = {}
+    for row in recent:
+        if row.get('cached') or row.get('error_text'):
+            continue
+        groups.setdefault(_lineage_key(row), []).append(row)
+    stalled = {}
+    for key, rows in groups.items():
+        rows.sort(key=lambda r: (r.get('ts') or 0, r.get('id') or 0), reverse=True)
+        rows = rows[:12]
+        if any(str(r.get('submit_status') or '').startswith('submitted') for r in rows):
+            continue
+        buckets = {}
+        for row in rows:
+            check = feedback.bottleneck(row)
+            if not check:
+                continue
+            signature = tuple(check.get(k) for k in (
+                'name', 'limit', 'year', 'startDate', 'endDate'))
+            buckets.setdefault(signature, []).append(feedback.deficit(check))
+        for signature, gaps in buckets.items():
+            if len(gaps) >= 8 and min(gaps[:4]) >= min(gaps[4:]) - 0.02:
+                stalled[key] = signature[0]
+                break
+    return stalled
 
 
 def policy_log_config(policy: dict | None) -> dict[str, Any]:
@@ -211,6 +259,8 @@ def policy_log_config(policy: dict | None) -> dict[str, Any]:
         "quarantine_share": MAX_QUARANTINED_SHARE,
         "quarantined": list(policy.get("quarantined") or []),
         "near_miss_keys": list(policy.get("near_miss_keys") or []),
+        "stalled_lineages": dict(policy.get("stalled_lineages") or {}),
+        "single_axis_share": SINGLE_AXIS_SHARE,
         "allocation": dict(policy.get("allocation") or {}),
         "submit_policy": "probe_first_wqb_ground_truth",
         "post_submit_observation_s": 900.0,
@@ -223,7 +273,7 @@ def candidate_priority(row: dict, policy: dict | None = None) -> float:
     key = dataset_key(row)
     if key in set(policy.get("quarantined") or []):
         return -100.0
-    metrics = row.get("metrics") or {}
+    metrics = feedback.effective_metrics(row)
     sharpe = _number(metrics.get("sharpe")) or 0.0
     fitness = _number(metrics.get("fitness")) or 0.0
     regions = [_number(metrics.get(k)) for k in (
@@ -235,7 +285,12 @@ def candidate_priority(row: dict, policy: dict | None = None) -> float:
         near_bonus += 1.0
     lineage = (policy.get("dataset_stats") or {}).get(key) or {}
     conversion = 2.0 * float(lineage.get("strict_rate") or 0.0)
-    return near_bonus + conversion + sharpe + 0.8 * fitness + 0.35 * regional
+    gaps = [min(2.0, feedback.deficit(c)) for c in feedback.observations(row)
+            if c.get('result') == 'FAIL' and feedback.deficit(c) is not None]
+    failure_penalty = 2.0 * max(gaps, default=0.0) + 0.25 * sum(gaps)
+    stalled_penalty = 5.0 if _lineage_key(row) in policy.get('stalled_lineages', {}) else 0.0
+    return (near_bonus + conversion + sharpe + 0.8 * fitness + 0.35 * regional
+            - failure_penalty - stalled_penalty)
 
 
 def select_seed_rows(rows: Iterable[dict], policy: dict | None = None,
@@ -291,6 +346,9 @@ def focus_allowed(row: dict, policy: dict | None = None) -> tuple[bool, str]:
     key = dataset_key(row)
     if key in set((policy or {}).get("quarantined") or []):
         return False, f"quarantined PROD-correlation lineage {key}"
+    stalled = (policy or {}).get('stalled_lineages') or {}
+    if _lineage_key(row) in stalled:
+        return False, f"no progress on {stalled[_lineage_key(row)]} in eight comparable failures"
     return True, "actionable non-quarantined lineage"
 
 
@@ -320,7 +378,7 @@ def choose_search_mode(round_num: int, recent: Iterable[dict] | None = None,
     # lineage never flips the whole system into escape mode.
     if int(policy.get("near_miss_count") or 0) > 0:
         if int(round_num or 0) % 4 == 0:
-            return "escape", "scheduled 25% dataset/structure exploration"
+            return "explore", "scheduled independent exploration with single-axis probes"
         return "exploit", "non-quarantined near-miss conversion"
 
     sharpes: list[float] = []
@@ -333,10 +391,10 @@ def choose_search_mode(round_num: int, recent: Iterable[dict] | None = None,
         new = [x for x in sharpes[:12] if not math.isnan(x)]
         old = [x for x in sharpes[12:24] if not math.isnan(x)]
         if new and old and max(new) <= max(old) + 0.02:
-            return "escape", "12-candidate Sharpe plateau"
+            return "explore", "12-candidate Sharpe plateau: independent exploration"
 
     if int(round_num or 0) % 4 == 0:
-        return "escape", "scheduled 25% dataset/structure exploration"
+        return "explore", "scheduled independent exploration with single-axis probes"
     return "exploit", "1–2 axis local refinement"
 
 
@@ -384,6 +442,8 @@ def concentration_filter(strategies: list[dict], *, min_keep: int = 8,
     ordered: list[tuple[int, dict, list[str], str]] = []
     covered_ds: set[str] = set()
     covered_expr: set[str] = set()
+    reserved_sweeps = 0
+    sweep_target = math.ceil(len(strategies) * SINGLE_AXIS_SHARE)
     remaining = list(pool)
     while remaining:
         def coverage_key(item):
@@ -391,13 +451,16 @@ def concentration_filter(strategies: list[dict], *, min_keep: int = 8,
             new_ds = set(datasets) - covered_ds
             recent_load = sum(recent_count[d] for d in datasets)
             rarity = sum(1.0 / max(1, pool_count[d]) for d in datasets)
-            return (bool(new_ds), bool(new_ds) and len(datasets) == 1,
+            reserve = (_strategy.get('origin') == 'sweep' and reserved_sweeps < sweep_target
+                       and _strategy['_v2_lineage']['dataset_key'] not in quarantined)
+            return (reserve, bool(new_ds), bool(new_ds) and len(datasets) == 1,
                     len(new_ds), -recent_load, expression not in covered_expr,
                     rarity, -pos)
 
         picked = max(remaining, key=coverage_key)
         remaining.remove(picked)
         ordered.append(picked)
+        reserved_sweeps += picked[1].get('origin') == 'sweep'
         covered_ds.update(picked[2])
         covered_expr.add(picked[3])
 
@@ -519,7 +582,7 @@ def prune_focus_queue(queue: Iterable[dict] | None,
 
 
 def promote_submit_evidence(result: dict) -> dict:
-    """Promote correlation values in a submit response into metrics/check buckets."""
+    """Preserve all submission checks and use them in the next research decision."""
     status = str(result.get("submit_status") or "")
     if not status:
         return result
@@ -530,6 +593,27 @@ def promote_submit_evidence(result: dict) -> dict:
     is_status.setdefault("error", [])
     is_status.setdefault("pending", [])
     is_status.setdefault("warning", [])
+    observations = feedback.observations(result)
+    if observations:
+        metrics['_submit_checks'] = observations
+        for check in observations:
+            name = check['name']
+            state = str(check.get('result') or '').lower()
+            bucket = {'pass': 'pass', 'fail': 'fail', 'error': 'error',
+                      'pending': 'pending', 'warning': 'warning'}.get(state)
+            if not bucket:
+                continue
+            for items in is_status.values():
+                if isinstance(items, list):
+                    items[:] = [c for c in items if
+                                (c.get('name') if isinstance(c, dict) else c) != name]
+            value, limit = check.get('value'), check.get('limit')
+            is_status[bucket].append({
+                'name': name, 'result': state.upper(),
+                'value': '' if value is None else str(value),
+                'cutoff': '' if limit is None else str(limit),
+                'desc': (f'{name}({value} vs {limit})' if value is not None and limit is not None
+                         else f'{name}={state.upper()}')})
     for name, rx in _CORR_PATTERNS.items():
         match = rx.search(status)
         if not match:
@@ -545,6 +629,9 @@ def promote_submit_evidence(result: dict) -> dict:
                                       "desc": f"{name} of {value} is above cutoff of 0.7 (FAIL)"})
     result["metrics"] = metrics
     result["is_status"] = is_status
+    for bucket in ('pass', 'fail', 'error', 'pending'):
+        result[bucket + '_count'] = len(is_status.get(bucket, []))
+        result[bucket + '_items'] = list(is_status.get(bucket, []))
     return result
 
 

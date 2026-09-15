@@ -1679,7 +1679,7 @@ def _hydrate_alpha_row(r) -> dict[str, Any] | None:
 
 _SEED_COLS = ('id, code, code_hash, desc, pass_count, fail_count, error_count, '
               'metrics, round_num, idx, universe, neutralization, decay, truncation, '
-              'self_corr, generation, genome, fail_items')
+              'self_corr, generation, genome, fail_items, submit_status')
 
 
 def _theme_order(records: list[dict[str, Any]], constraint) -> list[dict[str, Any]]:

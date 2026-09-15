@@ -224,8 +224,16 @@ def test_genome_from_alpha_roundtrips_renderer_output():
     g = r['genome']
     # 3번째 필드는 combine='triple' 일 때만 코드에 발현된다 — 발현된 유전자만
     # 역추출을 보장할 수 있다.
-    expressed = {f for f in g['fields'] if f in r['code']}
-    assert expressed and expressed <= set(back['fields'])
+    # A synthetic field expands into its raw inputs and never appears literally.
+    from server import alpha_ast
+    expressed = set()
+    for field in g['fields'][:3 if g['combine'] == 'triple' else 2]:
+        expression = genome_models.SYNTHETIC_FIELDS.get(field, field)
+        expressed.update(alpha_ast.fields_used(expression))
+    recovered = set()
+    for field in back['fields']:
+        recovered.update(alpha_ast.fields_used(genome_models.SYNTHETIC_FIELDS.get(field, field)))
+    assert expressed and expressed <= recovered
     assert back['universe'] == g['universe']
     assert back['neutralization'] == g['neutralization']
     assert back['decay'] == g['decay']

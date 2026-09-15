@@ -328,6 +328,10 @@ class ApiBackend:
             return self._err(s, 'pause로 취소', mode='cancelled')
         idx = int(s.get('idx') or 0)
         code = s.get('code', '')
+        from .field_types import numeric_input_reason
+        type_error = numeric_input_reason(code)
+        if type_error:
+            return self._err(s, f'preflight type: {type_error}')
         desc = s.get('desc', '')
         settings = dict(s.get('settings') or {})
         if forced_delay is not None:
@@ -451,6 +455,12 @@ class ApiBackend:
                         LOG.warning('description build/patch err (제출 계속): %s', e)
                     submit_ok, submit_status = self._client.submit_alpha(
                         alpha_id, stop_event=stop_event)
+                    # Copy while the submission lock is held: the client is
+                    # shared by simulation threads and the next submit replaces it.
+                    if getattr(self._client, '_last_submit_alpha_id', None) == alpha_id:
+                        checks = getattr(self._client, '_last_submit_checks', [])
+                        if checks:
+                            metrics['_submit_checks'] = [dict(c) for c in checks]
         except Exception as e:
             submit_status = f'submit_error:{e}'
         finally:

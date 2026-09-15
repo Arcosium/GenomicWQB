@@ -931,6 +931,9 @@ def _field_is_banned(field) -> bool:
       `((close-low)-(high-close))/(high-low)` 로 **전개되어 pv1 필드를 끌어온다**.
       전개식의 식별자까지 봐야 한다.
     """
+    from .field_types import group_fields
+    if str(field or '').lower() in group_fields():
+        return True
     banned = _CONSTRAINT_BANNED_FIELDS
     if not banned or not field:
         return False
@@ -1071,6 +1074,8 @@ def _error_tokens(errors: Iterable[dict] | None) -> set[str]:
 
 
 def _pick_fields(rng: random.Random, family: str, forbidden: set[str], delay) -> tuple[str, str, str]:
+    from .field_types import group_fields
+    groups = group_fields()
     if str(delay) == "0":
         # D0 팔레트가 있으면 그 안에서 family 를 존중한다(없으면 옛 동작 = pv 전용).
         pool = list((D0_DATASETS.get(family) or ()) if D0_DATASETS else ())
@@ -1080,7 +1085,7 @@ def _pick_fields(rng: random.Random, family: str, forbidden: set[str], delay) ->
         pool = list(SHARED_DATASETS.get(family) or SHARED_DATASETS["pv"])
         if len(pool) < 3:
             pool += list(SHARED_DATASETS["pv"])
-    pool = [f for f in pool if f not in forbidden]
+    pool = [f for f in pool if f not in forbidden and str(f).lower() not in groups]
     # 조건이 금지한 데이터셋의 필드는 애초에 뽑지 않는다.
     banned = _CONSTRAINT_BANNED_FIELDS
     if banned:
@@ -1090,10 +1095,13 @@ def _pick_fields(rng: random.Random, family: str, forbidden: set[str], delay) ->
             pool = filtered
         else:
             pool = [f for fam in SHARED_DATASETS.values() for f in fam
-                    if not _field_is_banned(f) and f not in forbidden]
+                    if not _field_is_banned(f) and f not in forbidden
+                    and str(f).lower() not in groups]
     if len(pool) < 3:
-        fallback = [f for f in SHARED_DATASETS["pv"] if not _field_is_banned(f)]
-        pool = fallback if len(fallback) >= 3 else list(SHARED_DATASETS["pv"])
+        fallback = [f for f in SHARED_DATASETS['pv']
+                    if not _field_is_banned(f) and str(f).lower() not in groups]
+        pool = fallback if len(fallback) >= 3 else [
+            f for f in SHARED_DATASETS['pv'] if str(f).lower() not in groups]
     rng.shuffle(pool)
     return (pool[0], pool[1], pool[2])
 
@@ -1133,7 +1141,7 @@ class BaseGenomeModel:
                  parent_genome=None, fail_items=None, seed_genomes=None,
                  slot_settings=None, salt: int = 0,
                  parent_alpha_id=None, seed_alpha_ids=None, directive_stats=None,
-                 spec_genomes=None, spec_ids=None, parent_metrics=None,
+                 spec_genomes=None, spec_ids=None, parent_metrics=None, seed_metrics=None,
                  search_mode: str = 'legacy'):
         self.round_num = int(round_num or 0)
         self.forced_delay = forced_delay
@@ -1149,15 +1157,21 @@ class BaseGenomeModel:
         _sids = list(seed_alpha_ids or [])
         self.seeds: list[Genome] = []
         self._alpha_id_by_genome: dict[Genome, int] = {}
+        self._metrics_by_genome = {}
+        _seed_metrics = list(seed_metrics or [])
         for _i, _s in enumerate(seed_genomes or []):
             _g = _coerce_genome(_s)
             if _g is None:
                 continue
             self.seeds.append(_g)
+            if _i < len(_seed_metrics):
+                self._metrics_by_genome[_g] = dict(_seed_metrics[_i] or {})
             if _i < len(_sids) and _sids[_i] is not None:
                 self._alpha_id_by_genome[_g] = int(_sids[_i])
         if self.parent is not None and parent_alpha_id is not None:
             self._alpha_id_by_genome[self.parent] = int(parent_alpha_id)
+        if self.parent is not None:
+            self._metrics_by_genome[self.parent] = self.parent_metrics
         self.slot_settings = list(slot_settings or [])
         self.salt = int(salt or 0)
         # (category, directive) → {'n','wins'} 관측 행렬. None 이면 규칙 기반 선택,
@@ -1197,11 +1211,21 @@ class BaseGenomeModel:
         return self._plan_ga(n)
 
     def _plan_ga(self, n: int) -> list[tuple[str, Genome | None, Genome | None]]:
+        from .research_v2 import SINGLE_AXIS_SHARE
+        sweep_n = (max(1, math.ceil(n * SINGLE_AXIS_SHARE))
+                   if self.search_mode != 'legacy' else SWEEP_SLOTS)
+        sweep_n = min(sweep_n, max(0, n - 2))
         if self.parent is not None:
-            if self.search_mode == 'exploit':
-                plan = [("sweep", self.parent, None)] * min(SWEEP_SLOTS, n)
+            if self.search_mode in ('exploit', 'explore'):
+                plan = [("sweep", self.parent, None)] * sweep_n
                 while len(plan) < n:
-                    plan.append(("local", self.parent, None))
+                    if self.search_mode == 'explore':
+                        plan.append(('random', None, None))
+                    else:
+                        # Alternate targeted repair with local probes. Before
+                        # 2.2 every exploit slot ignored the parent's failures.
+                        op = 'mutate' if self.fail_items and len(plan) % 2 == 0 else 'local'
+                        plan.append((op, self.parent, None))
                 # 소수 교차 슬롯은 국소 basin 에 새 유전자를 공급한다.
                 for j in range(min(2, len(self.seeds), max(0, n - 2))):
                     plan[n - 1 - j] = ("crossover", self.parent, self.seeds[j])
@@ -1234,12 +1258,14 @@ class BaseGenomeModel:
             return plan
         plan = []
         if self.seeds:
-            if self.search_mode == 'exploit':
+            if self.search_mode in ('exploit', 'explore'):
                 # 리서치 결과: 유망 부모 주변은 정확히 1~2축을 바꾼 국소 변이가
                 # 다축보다 덜 무너졌다. 70%는 local/sweep, 나머지만 새 구조에 쓴다.
-                for _ in range(min(SWEEP_SLOTS, n)):
-                    plan.append(("sweep", self.seeds[0], None))
-                local_n = max(0, math.ceil(n * 0.70) - len(plan))
+                for j in range(sweep_n):
+                    seed = self.seeds[(self.round_num + j) % len(self.seeds)]
+                    plan.append(("sweep", seed, None))
+                local_n = (max(0, math.ceil(n * 0.70) - len(plan))
+                           if self.search_mode == 'exploit' else 0)
                 for j in range(local_n):
                     plan.append(("local", self.seeds[j % len(self.seeds)], None))
                 while len(plan) < n:
@@ -1435,7 +1461,12 @@ class BaseGenomeModel:
         d = dict(parent.__dict__)
         directive = None
         if directed:
-            if self.directive_stats is not None:
+            from .submission_feedback import bottleneck
+            target = bottleneck({'metrics': self.parent_metrics})
+            if self.search_mode != 'legacy' and target:
+                categories = _mutation_learn.categorize([target['name']])
+                directive = _mutation_learn.RULE_DIRECTIVE.get(categories[0]) if categories else None
+            elif self.directive_stats is not None:
                 # 온라인 학습 경로 — 누적 (fail category × directive) 성공률로
                 # Thompson sampling. 관측이 없으면 사전확률 = 기존 규칙 우세.
                 directive = _mutation_learn.choose_directive(
@@ -1683,6 +1714,21 @@ class BaseGenomeModel:
         회전율이 측정돼 있으면 감쇠 축은 **필요한 값 주변**을 훑는다(맹목 스윕 방지).
         """
         d = dict(parent.__dict__)
+        parent_metrics = self._metrics_by_genome.get(parent, self.parent_metrics)
+        from .submission_feedback import bottleneck, effective_metrics, STABILITY
+        target = bottleneck({'metrics': parent_metrics})
+        if self.search_mode != 'legacy' and target and target['name'] in STABILITY:
+            # Test one temporal robustness lever at a time. All proposals still
+            # face the same WQB submission probe and active scope constraints.
+            axes = [('lookback_a', CANONICAL_LOOKBACKS),
+                    ('lookback_b', CANONICAL_LOOKBACKS),
+                    ('winsor_std', (0, 4)), ('regime', ('OFF',))]
+            axes = [(key, [v for v in values if v != d[key]]) for key, values in axes]
+            axes = [(key, values) for key, values in axes if values]
+            key, values = axes[(slot + attempt - 1) % len(axes)]
+            d[key] = values[(attempt - 1) % len(values)]
+            d['generation'] = int(d.get('generation') or 0) + 1
+            return Genome(**d)
         axis = slot % 2
         if axis == 0:
             # ⚠ 순회 순서는 **SWEEP_NEUTRALIZATIONS 기준**이어야 한다. NEUTRALIZATIONS
@@ -1695,7 +1741,7 @@ class BaseGenomeModel:
             d["neutralization"] = cand[(attempt - 1) % len(cand)]
         else:
             want = decay_for_target_turnover(int(d.get("decay") or 0),
-                                             self.parent_metrics.get("turnover"))
+                                             effective_metrics({'metrics': parent_metrics}).get('turnover'))
             if want is not None and want != int(d.get("decay") or 0):
                 d["decay"] = want
             else:
@@ -1763,6 +1809,13 @@ class BaseGenomeModel:
         if self.forbidden and any(f in self.forbidden for f in d["fields"]):
             d["fields"] = _pick_fields(rng, d.get("family") or "pv",
                                        self.forbidden, self.forced_delay)
+        from .field_types import group_fields
+        groups = group_fields()
+        if any(str(f).lower() in groups for f in d['fields']):
+            replacements = iter(_pick_fields(rng, d.get('family') or 'pv',
+                                              self.forbidden, self.forced_delay))
+            d['fields'] = tuple(next(replacements) if str(f).lower() in groups else f
+                                for f in d['fields'])
         # 탐색 조건은 **맨 마지막**에 건다. 모든 유전체(random/mutate/crossover/spec/seed)가
         # 이 메서드를 지나므로 여기 한 곳이면 조건 밖 알파가 애초에 생기지 않는다.
         _apply_constraint(d)
@@ -1870,7 +1923,7 @@ def generate_population(*, account_type: str, round_num: int, forced_delay=None,
                         slot_settings=None, salt: int = 0,
                         parent_alpha_id=None, seed_alpha_ids=None,
                         directive_stats=None, spec_genomes=None,
-                        spec_ids=None, parent_metrics=None,
+                        spec_ids=None, parent_metrics=None, seed_metrics=None,
                         search_mode: str = 'legacy') -> list[dict]:
     cls = (ResearchConsultantGenomeModel
            if account_type == "research_consultant" else StandardGenomeModel)
@@ -1880,5 +1933,5 @@ def generate_population(*, account_type: str, round_num: int, forced_delay=None,
                salt=salt, parent_alpha_id=parent_alpha_id,
                seed_alpha_ids=seed_alpha_ids,
                directive_stats=directive_stats, spec_genomes=spec_genomes,
-               spec_ids=spec_ids, parent_metrics=parent_metrics,
+               spec_ids=spec_ids, parent_metrics=parent_metrics, seed_metrics=seed_metrics,
                search_mode=search_mode).generate(n=n)
