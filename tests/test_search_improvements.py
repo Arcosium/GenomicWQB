@@ -26,13 +26,13 @@ def test_four_single_axis_slots_in_fourteen_are_spread_across_parents(mode):
     children = gm.generate_population(account_type='research_consultant',
         round_num=234, forced_delay='1', n=14,
         seed_genomes=[s['genome'] for s in seeds], seed_alpha_ids=[1, 2, 3, 4, 5],
+        seed_metrics=[{'sharpe': 1.5, 'fitness': 0.9}] * 5,
         search_mode=mode)
     sweeps = [s for s in children if s['origin'] == 'sweep']
     assert len(children) == 14 and len(sweeps) == 4
     assert len({s['parent_alpha_id'] for s in sweeps}) == 4
     assert all(len(s['genes_changed']) == 1 for s in sweeps)
-    if mode == 'explore':
-        assert sum(s['origin'] == 'random' for s in children) == 10
+    assert sum(s['origin'] == 'random' for s in children) <= len(children) * 0.30
 
 
 def test_parent_turnover_is_used_in_its_own_sweep():
@@ -107,7 +107,8 @@ def test_stalled_lineage_releases_focus_and_recovers_after_progress():
     recent = [row(1.0, id=i, ts=i) for i in range(1, 13)]
     p = policy.build_lineage_policy(recent)
     assert not policy.focus_allowed(recent[-1], p)[0]
-    assert policy.focus_allowed({'code': 'rank(volume)', 'metrics': {}}, p)[0]
+    assert policy.focus_allowed({'code': 'rank(volume)',
+                                 'metrics': {'sharpe': 1.5, 'fitness': 0.9}}, p)[0]
     assert not policy.focus_allowed({'parent_code': 'rank(close)'}, p)[0]
     recent[-1] = row(1.3, id=12, ts=12)
     assert policy.focus_allowed(recent[-1], policy.build_lineage_policy(recent))[0]
@@ -202,3 +203,74 @@ def test_pending_stability_is_not_counted_as_progress():
     child = row(1.5, submit_status='submit_pending_timeout')
     child['metrics']['_submit_checks'][0]['result'] = 'PENDING'
     assert feedback.stability_improved(parent, child) is None
+
+
+def test_plateau_and_stricter_checks_cannot_expand_exploration_cadence():
+    recent = [row(0.2, id=i, ts=i) for i in range(40)]
+    p = {'near_miss_count': 0, 'quarantined': []}
+    modes = [policy.choose_search_mode(i, recent, policy=p)[0] for i in range(1, 41)]
+    assert modes.count('explore') == 10
+    assert modes.count('exploit') == 30
+    assert all(policy.choose_search_mode(i, recent, focus_code='rank(close)',
+                                        policy=p)[0] == 'exploit' for i in range(1, 41))
+
+
+@pytest.mark.parametrize('mode', ['exploit', 'explore'])
+def test_focus_never_generates_unrelated_random_children(mode):
+    gm.set_constraint(None)
+    seed = gm.generate_population(account_type='research_consultant',
+                                  round_num=125, forced_delay='1', n=1)[0]['genome']
+    children = gm.generate_population(account_type='research_consultant',
+        round_num=444, forced_delay='1', n=14, parent_genome=seed,
+        parent_alpha_id=123, parent_metrics={'sharpe': 1.5, 'fitness': 0.9},
+        fail_items=['LOW_GLB_EMEA_SHARPE'], search_mode=mode)
+    assert len(children) == 14
+    assert all(s['parent_alpha_id'] == 123 and s['origin'] != 'random' for s in children)
+
+
+def test_sweep_budget_goes_only_to_measured_signal():
+    gm.set_constraint(None)
+    seeds = gm.generate_population(account_type='research_consultant',
+                                    round_num=123, forced_delay='1', n=5)
+    metrics = [{'sharpe': -0.5, 'fitness': -0.1}, {},
+               {'sharpe': 0.5, 'fitness': 0.3},
+               {'sharpe': 1.5, 'fitness': 0.9},
+               {'sharpe': 2, 'fitness': 2, '_submit_checks': [
+                   observed(36, limit=500, name='LOW_DURATION')]}]
+    children = gm.generate_population(account_type='research_consultant',
+        round_num=234, forced_delay='1', n=14,
+        seed_genomes=[s['genome'] for s in seeds], seed_alpha_ids=[1, 2, 3, 4, 5],
+        seed_metrics=metrics, search_mode='exploit')
+    sweeps = [s for s in children if s['origin'] == 'sweep']
+    assert sweeps and all(s['parent_alpha_id'] == 4 for s in sweeps)
+    for m in metrics[:3] + metrics[4:]:
+        assert not policy.focus_allowed({'code': 'rank(close)', 'metrics': m})[0]
+
+
+def test_exhausted_sweeps_refill_with_local_children_of_same_parent():
+    gm.set_constraint(None)
+    seed = gm.generate_population(account_type='research_consultant',
+                                  round_num=125, forced_delay='1', n=1)[0]['genome']
+    children = gm.generate_population(account_type='research_consultant',
+        round_num=444, forced_delay='1', n=14, parent_genome=seed,
+        parent_alpha_id=123, parent_metrics={'sharpe': 1.5, 'fitness': 0.9},
+        fail_items=['LOW_GLB_EMEA_SHARPE'], search_mode='exploit',
+        accept_candidate=lambda s: s['origin'] != 'sweep')
+    assert len(children) == 14
+    assert all(s['parent_alpha_id'] == 123 for s in children)
+    assert not any(s['origin'] in ('random', 'sweep') for s in children)
+
+
+def test_final_budget_excludes_cache_losses_and_specs_from_random_allowance():
+    # Most local proposals were duplicates. Specs are independently allocated,
+    # so they must not inflate the allowance for unrelated random candidates.
+    candidates = ([{'origin': 'local', 'idx': i} for i in range(3)]
+                  + [{'origin': 'spec', 'idx': 10 + i} for i in range(8)]
+                  + [{'origin': 'random', 'idx': 20 + i} for i in range(4)])
+    kept, deferred = policy.limit_random_candidates(candidates)
+    assert len(deferred) == 3
+    assert sum(s['origin'] == 'random' for s in kept) == 1
+    assert sum(s['origin'] == 'spec' for s in kept) == 8
+    kept, _ = policy.limit_random_candidates(candidates, focus=True)
+    assert all(s['origin'] != 'random' for s in kept)
+    assert policy.limit_random_candidates(candidates, bootstrap=True) == (candidates, [])

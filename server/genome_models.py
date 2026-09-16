@@ -1142,7 +1142,7 @@ class BaseGenomeModel:
                  slot_settings=None, salt: int = 0,
                  parent_alpha_id=None, seed_alpha_ids=None, directive_stats=None,
                  spec_genomes=None, spec_ids=None, parent_metrics=None, seed_metrics=None,
-                 search_mode: str = 'legacy'):
+                 search_mode: str = 'legacy', accept_candidate=None):
         self.round_num = int(round_num or 0)
         self.forced_delay = forced_delay
         self.feedback = feedback or []
@@ -1178,6 +1178,7 @@ class BaseGenomeModel:
         # dict(빈 것 포함)이면 Thompson sampling 학습 선택.
         self.directive_stats = directive_stats
         self.search_mode = str(search_mode or 'legacy')
+        self.accept_candidate = accept_candidate
         self._last_directive: str | None = None
         # LLM 전략스펙 — **변이 없이 그대로** 시뮬되는 초기 개체(1회성).
         # 사용자가 요청한 아이디어를 GA 가 손대기 전에 원본 그대로 한 번 측정해야
@@ -1211,21 +1212,19 @@ class BaseGenomeModel:
         return self._plan_ga(n)
 
     def _plan_ga(self, n: int) -> list[tuple[str, Genome | None, Genome | None]]:
-        from .research_v2 import SINGLE_AXIS_SHARE
+        from .research_v2 import SINGLE_AXIS_SHARE, MAX_RANDOM_SHARE, refinement_eligible
         sweep_n = (max(1, math.ceil(n * SINGLE_AXIS_SHARE))
                    if self.search_mode != 'legacy' else SWEEP_SLOTS)
         sweep_n = min(sweep_n, max(0, n - 2))
         if self.parent is not None:
             if self.search_mode in ('exploit', 'explore'):
-                plan = [("sweep", self.parent, None)] * sweep_n
+                eligible = refinement_eligible({'metrics': self.parent_metrics})
+                plan = [("sweep", self.parent, None)] * (sweep_n if eligible else 0)
                 while len(plan) < n:
-                    if self.search_mode == 'explore':
-                        plan.append(('random', None, None))
-                    else:
-                        # Alternate targeted repair with local probes. Before
-                        # 2.2 every exploit slot ignored the parent's failures.
-                        op = 'mutate' if self.fail_items and len(plan) % 2 == 0 else 'local'
-                        plan.append((op, self.parent, None))
+                    # A focus batch always works on its selected parent, even
+                    # if an old caller still supplies the explore mode.
+                    op = 'mutate' if self.fail_items and len(plan) % 2 == 0 else 'local'
+                    plan.append((op, self.parent, None))
                 # 소수 교차 슬롯은 국소 basin 에 새 유전자를 공급한다.
                 for j in range(min(2, len(self.seeds), max(0, n - 2))):
                     plan[n - 1 - j] = ("crossover", self.parent, self.seeds[j])
@@ -1259,15 +1258,19 @@ class BaseGenomeModel:
         plan = []
         if self.seeds:
             if self.search_mode in ('exploit', 'explore'):
-                # 리서치 결과: 유망 부모 주변은 정확히 1~2축을 바꾼 국소 변이가
-                # 다축보다 덜 무너졌다. 70%는 local/sweep, 나머지만 새 구조에 쓴다.
-                for j in range(sweep_n):
-                    seed = self.seeds[(self.round_num + j) % len(self.seeds)]
+                sweep_seeds = [g for g in self.seeds if refinement_eligible(
+                    {'metrics': self._metrics_by_genome.get(g, {})})]
+                for j in range(sweep_n if sweep_seeds else 0):
+                    seed = sweep_seeds[(self.round_num + j) % len(sweep_seeds)]
                     plan.append(("sweep", seed, None))
-                local_n = (max(0, math.ceil(n * 0.70) - len(plan))
-                           if self.search_mode == 'exploit' else 0)
+                random_n = math.floor(n * MAX_RANDOM_SHARE)
+                local_n = max(0, n - random_n - len(plan))
                 for j in range(local_n):
-                    plan.append(("local", self.seeds[j % len(self.seeds)], None))
+                    a = self.seeds[j % len(self.seeds)]
+                    if self.search_mode == 'explore' and j < 2 and len(self.seeds) > 1:
+                        plan.append(("crossover", a, self.seeds[(j + 1) % len(self.seeds)]))
+                    else:
+                        plan.append(("local", a, None))
                 while len(plan) < n:
                     plan.append(("random", None, None))
                 return plan
@@ -1325,11 +1328,20 @@ class BaseGenomeModel:
             # 부모 그대로(무변이) 재출현 방지 — 이미 시뮬한 조합.
             seen.add(self._dedup_key(self.parent))
         i = 0
+        slot_attempts = 0
+        last_slot = -1
         while len(out) < n and i < n * 10:
             i += 1
             rng = self._rng(i)
             slot = len(out)
+            if slot != last_slot:
+                last_slot, slot_attempts = slot, 0
+            slot_attempts += 1
             op, a, b = plan[slot]
+            if self.accept_candidate and op == 'sweep' and slot_attempts > 8:
+                # An exhausted knob grid must not donate its slot to random
+                # search. Broaden to a local variation of the same parent.
+                op, b = 'local', None
             directive = None
             base = None            # 유전자 diff 의 기준 부모 (mutate/xo 의 주부모)
             spec_id = None
@@ -1381,7 +1393,9 @@ class BaseGenomeModel:
                 genes_changed = [k for k in _GENE_NAMES
                                  if k not in ("model", "generation")
                                  and getattr(g, k) != getattr(base, k)]
-            out.append({
+            if self.search_mode != 'legacy' and op == 'sweep' and len(genes_changed) != 1:
+                continue
+            candidate = {
                 "idx": len(out) + 1,
                 "code": render(g),
                 "desc": self._desc(g, op),
@@ -1394,7 +1408,11 @@ class BaseGenomeModel:
                                     if base is not None else None),
                 "genes_changed": genes_changed,
                 "spec_id": spec_id,
-            })
+            }
+            if (self.accept_candidate and op != 'spec'
+                    and not self.accept_candidate(candidate)):
+                continue
+            out.append(candidate)
         return out
 
     @staticmethod
@@ -1924,7 +1942,7 @@ def generate_population(*, account_type: str, round_num: int, forced_delay=None,
                         parent_alpha_id=None, seed_alpha_ids=None,
                         directive_stats=None, spec_genomes=None,
                         spec_ids=None, parent_metrics=None, seed_metrics=None,
-                        search_mode: str = 'legacy') -> list[dict]:
+                        search_mode: str = 'legacy', accept_candidate=None) -> list[dict]:
     cls = (ResearchConsultantGenomeModel
            if account_type == "research_consultant" else StandardGenomeModel)
     return cls(round_num=round_num, forced_delay=forced_delay, errors=errors,
@@ -1934,4 +1952,4 @@ def generate_population(*, account_type: str, round_num: int, forced_delay=None,
                seed_alpha_ids=seed_alpha_ids,
                directive_stats=directive_stats, spec_genomes=spec_genomes,
                spec_ids=spec_ids, parent_metrics=parent_metrics, seed_metrics=seed_metrics,
-               search_mode=search_mode).generate(n=n)
+               search_mode=search_mode, accept_candidate=accept_candidate).generate(n=n)

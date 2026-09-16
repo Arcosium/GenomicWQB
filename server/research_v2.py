@@ -21,8 +21,11 @@ from . import settings_fp
 from . import submission_feedback as feedback
 
 
-POLICY_VERSION = "genomicwqb-2.2.0"
+POLICY_VERSION = "genomicwqb-2.2.1"
 SINGLE_AXIS_SHARE = 0.28
+MAX_RANDOM_SHARE = 0.30
+MIN_REFINEMENT_SHARPE = 1.0
+MIN_REFINEMENT_FITNESS = 0.5
 MAX_DATASET_SHARE = 0.25
 MAX_EXPRESSION_SHARE = 0.30
 MAX_QUARANTINED_SHARE = 0.10
@@ -206,6 +209,9 @@ def build_lineage_policy(recent: Iterable[dict] | None = None) -> dict[str, Any]
         "near_miss_count": sum(stats[k]["near_miss"] for k in near_keys),
         "stalled_lineages": stalled_lineages(recent),
         "single_axis_share": SINGLE_AXIS_SHARE,
+        "max_random_share": MAX_RANDOM_SHARE,
+        "refinement_floor": {"sharpe": MIN_REFINEMENT_SHARPE,
+                             "fitness": MIN_REFINEMENT_FITNESS},
         "allocation": {"near_miss": 0.45, "exploration": 0.30,
                        "correlation_escape": 0.15, "hypothesis": 0.10},
     }
@@ -261,6 +267,9 @@ def policy_log_config(policy: dict | None) -> dict[str, Any]:
         "near_miss_keys": list(policy.get("near_miss_keys") or []),
         "stalled_lineages": dict(policy.get("stalled_lineages") or {}),
         "single_axis_share": SINGLE_AXIS_SHARE,
+        "max_random_share": MAX_RANDOM_SHARE,
+        "refinement_floor": {"sharpe": MIN_REFINEMENT_SHARPE,
+                             "fitness": MIN_REFINEMENT_FITNESS},
         "allocation": dict(policy.get("allocation") or {}),
         "submit_policy": "probe_first_wqb_ground_truth",
         "post_submit_observation_s": 900.0,
@@ -349,7 +358,20 @@ def focus_allowed(row: dict, policy: dict | None = None) -> tuple[bool, str]:
     stalled = (policy or {}).get('stalled_lineages') or {}
     if _lineage_key(row) in stalled:
         return False, f"no progress on {stalled[_lineage_key(row)]} in eight comparable failures"
+    if not refinement_eligible(row):
+        return False, "parent lacks measured signal for local refinement"
     return True, "actionable non-quarantined lineage"
+
+
+def refinement_eligible(row: dict) -> bool:
+    """Spend refinement slots on measured signal; this is not a submission gate."""
+    metrics = feedback.effective_metrics(row)
+    sharpe = feedback.number(metrics.get('sharpe'))
+    fitness = feedback.number(metrics.get('fitness'))
+    return (not row.get('error_text') and sharpe is not None and fitness is not None
+            and sharpe >= MIN_REFINEMENT_SHARPE and fitness >= MIN_REFINEMENT_FITNESS
+            and not any(c['name'] == 'LOW_DURATION' and c.get('result') in ('FAIL', 'ERROR')
+                        for c in feedback.observations(row)))
 
 
 def choose_search_mode(round_num: int, recent: Iterable[dict] | None = None,
@@ -373,6 +395,7 @@ def choose_search_mode(round_num: int, recent: Iterable[dict] | None = None,
             return "escape", (f"focus exact-lineage quarantine {focus_key} "
                               f"{int(st.get('prod_rejects') or 0)}/"
                               f"{int(st.get('prod_observations') or 0)}")
+        return "exploit", "focus parent refinement; independent exploration stays in main rounds"
 
     # Actionable near passes receive most rounds.  A correlation wall in one
     # lineage never flips the whole system into escape mode.
@@ -381,21 +404,35 @@ def choose_search_mode(round_num: int, recent: Iterable[dict] | None = None,
             return "explore", "scheduled independent exploration with single-axis probes"
         return "exploit", "non-quarantined near-miss conversion"
 
-    sharpes: list[float] = []
-    for row in [r for r in rows if dataset_key(r) not in quarantined][:40]:
-        try:
-            sharpes.append(float((row.get("metrics") or {}).get("sharpe")))
-        except (TypeError, ValueError):
-            sharpes.append(float("nan"))
-    if len(sharpes) >= 24:
-        new = [x for x in sharpes[:12] if not math.isnan(x)]
-        old = [x for x in sharpes[12:24] if not math.isnan(x)]
-        if new and old and max(new) <= max(old) + 0.02:
-            return "explore", "12-candidate Sharpe plateau: independent exploration"
-
+    # A short plateau must not multiply exploration rounds. Adding real submit
+    # checks made near-miss counts smaller in 2.2 and this fallback sent 52/93
+    # rounds into exploration, including focus rounds. Keep the fixed cadence.
     if int(round_num or 0) % 4 == 0:
         return "explore", "scheduled independent exploration with single-axis probes"
     return "exploit", "1–2 axis local refinement"
+
+
+def limit_random_candidates(strategies: list[dict], *, bootstrap: bool = False,
+                            focus: bool = False) -> tuple[list[dict], list[dict]]:
+    """Apply the research budget after duplicate/cache removal, before simulation.
+
+    Specs keep their allocation. A new search without any seed can bootstrap;
+    otherwise losing local candidates to dedup must not turn a batch random.
+    """
+    if bootstrap and not focus:
+        return strategies, []
+    local_n = sum(s.get('origin') not in ('random', 'spec') for s in strategies)
+    cap = 0 if focus else math.floor(local_n * MAX_RANDOM_SHARE / (1 - MAX_RANDOM_SHARE))
+    kept, dropped = [], []
+    random_n = 0
+    for s in strategies:
+        if s.get('origin') == 'random':
+            random_n += 1
+            if random_n > cap:
+                dropped.append(s)
+                continue
+        kept.append(s)
+    return kept, dropped
 
 
 def concentration_filter(strategies: list[dict], *, min_keep: int = 8,

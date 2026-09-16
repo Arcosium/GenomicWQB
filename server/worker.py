@@ -1294,7 +1294,7 @@ class Worker(threading.Thread):
                 if _focus_pruned:
                     _db.set_focus_queue(self.user_id, focus_queue)
                     self._log(0, f'🧹 v2 focus 부채 {_focus_pruned}건 정리 — '
-                                 '현재 메인 라운드의 부모·phase 1만 유지')
+                                 '부모 품질·정체·현재 라운드 기준 적용')
             except Exception as e:
                 self._log_quiet(0, f'⚠ v2 focus 큐 정리 실패(기존 큐 유지): {e}')
         # Near-miss priority: sort by closeness_score (near-pass first).
@@ -1366,7 +1366,7 @@ class Worker(threading.Thread):
                     policy=_v21_policy)
                 _q = ', '.join(_v21_policy.get('quarantined') or []) or '없음'
                 self._log(round_num,
-                          f'  🧭 v2.1 탐색 모드 = {_search_mode} — {_mode_reason} '
+                          f'  🧭 {_v2_policy.POLICY_VERSION} 탐색 모드 = {_search_mode} — {_mode_reason} '
                           f'(격리 계보: {_q})')
             except Exception as e:
                 self._log_quiet(round_num, f'⚠ v2 탐색 모드 결정 실패(legacy 폴백): {e}')
@@ -1625,6 +1625,24 @@ class Worker(threading.Thread):
                     self._log_quiet(round_num, f'⚠ directive_stats 조회 실패: {_e}')
                     _dstats = None
 
+            _generation_known = set()
+
+            def _accept_new_candidate(candidate):
+                # Preserve refinement slots before concentration/caching can
+                # remove them. A used sweep is replaced by a new local probe.
+                from . import research_v2 as _research
+                _can = _research.canonicalize(
+                    candidate['code'], candidate.get('settings') or {}, forced_delay)
+                _key = _can['canonical_key']
+                if _key in _generation_known:
+                    return False
+                if (_db.code_settings_rejected_before(
+                        self.user_id, _can['code'], _can['settings_fp'])
+                        or _db.code_submitted_before(self.user_id, _can['code'])):
+                    _generation_known.add(_key)
+                    return False
+                return True
+
             strategies = genome_models.generate_population(
                 account_type=account_type,
                 round_num=(round_num * 1000) + (phase * 100) + int(parent_idx or 0),
@@ -1647,9 +1665,13 @@ class Worker(threading.Thread):
                 spec_genomes=[s['genome'] for s in pending_specs] or None,
                 spec_ids=[s['id'] for s in pending_specs] or None,
                 search_mode=_search_mode,
+                accept_candidate=(_accept_new_candidate if _v2_enabled else None),
             )
             if not strategies:
                 raise RuntimeError('Genome generated no strategies')
+            if _generation_known:
+                self._log(round_num,
+                          f'  생성 중 기지 조합 {len(_generation_known)}개를 새 변형으로 교체')
 
             _origins = {'random': 0, 'mutate': 0, 'local': 0, 'escape': 0,
                         'crossover': 0, 'sweep': 0, 'spec': 0}
@@ -2187,6 +2209,20 @@ class Worker(threading.Thread):
                     cached_results.append(result_cache.materialize(s, cached, round_num))
                 else:
                     to_simulate.append(s)
+            if _v2_enabled:
+                _bootstrap = not seed_genomes and parent_genome is None
+                to_simulate, _budget_deferred = _v2_policy.limit_random_candidates(
+                    to_simulate, bootstrap=_bootstrap,
+                    focus=is_focus and _search_mode != 'escape')
+                for _s in _budget_deferred:
+                    _db.v2_mark_experiment(
+                        self.user_id, round_id, int(_s['idx']), 'DEFERRED',
+                        reason='random exploration budget after dedup: max 30%')
+                _random_n = sum(s.get('origin') == 'random' for s in to_simulate)
+                self._log(round_num,
+                          f'  실제 시뮬 배분 — 무작위 {_random_n}/{len(to_simulate)} · '
+                          f'예산 보류 {len(_budget_deferred)}'
+                          + (' · 시드 없는 초기 탐색' if _bootstrap else ''))
             cache_hit_total = len(cached_results)
             # 📤 캐시히트도 발사한다 (2026-08-22 사장 비상 지시의 항구 수정) —
             # 캐시로 돌아온 알파는 partial 스트림(즉시 제출 경로)을 안 타서, 차단
