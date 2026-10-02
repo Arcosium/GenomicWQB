@@ -31,11 +31,26 @@ _CSV_PATH = os.path.normpath(_CSV_PATH)
 # ---------------------------------------------------------------------------
 
 def _all_csv_rows() -> list[dict]:
-    rows = []
-    with open(_CSV_PATH, 'r', encoding='utf-8') as fh:
-        for row in csv.DictReader(fh):
-            rows.append(row)
-    return rows
+    """팔레트가 실제로 읽는 소스와 **같은 것**을 본다 = 라이브 CSV ∪ 정적 CSV.
+
+    ⚠ 예전엔 정적 CSV 만 읽었는데, 그건 라이브 CSV 가 없던 시절에만 맞는 가정이었다.
+      라이브 수집(scripts/refresh_datafields.py)이 한 번 돌면 팔레트는 두 파일의
+      합집합을 쓰므로, 정적 CSV 만 기대하는 테스트는 환경에 따라 깨진다
+      (2026-07-21 D0 팔레트 도입 때 실제로 깨졌다).
+    """
+    return dp._all_rows()
+
+
+def _usa_csv_rows() -> list[dict]:
+    """build_palette(region='USA') 가 실제로 보는 풀 — USA 행만.
+
+    ⚠ 2026-07-27 부터 라이브 CSV 는 **다중 리전**을 담는다(GLB 테마 주간에 수집).
+      팔레트는 리전을 먼저 고정하고 이름 중복을 접으므로, 인덱스/검증도 같은
+      리전 풀 위에서 세야 한다 — 안 그러면 GLB 전용 필드가 인덱스를 밀어
+      seed 계산이 어긋난다.
+    """
+    return [r for r in dp._all_rows()
+            if str(r.get('region') or '').strip().upper() == 'USA']
 
 
 def _palette_field_names(text: str) -> list[str]:
@@ -94,12 +109,11 @@ class TestRegionFilter:
         names = _palette_field_names(result)
         assert names, "Palette should have fields"
 
-        # Build lookup from CSV
-        csv_region = {row['name']: row['region'] for row in _all_csv_rows()}
+        # ⚠ 같은 필드가 여러 리전에 실재하므로 name→region 단일 매핑은 성립하지
+        #   않는다(마지막 행이 이긴다). '이 필드가 USA 로도 존재하는가' 를 본다.
+        usa_names = {row['name'] for row in _usa_csv_rows()}
         for name in names[:10]:  # spot-check first 10
-            assert name in csv_region, f"Field {name!r} not in CSV"
-            assert csv_region[name] == 'USA', \
-                f"Field {name!r} has region {csv_region[name]!r}, expected USA"
+            assert name in usa_names, f"Field {name!r} not in CSV with region=USA"
 
     def test_case_insensitive_region(self):
         """Region match is case-insensitive."""
@@ -147,8 +161,13 @@ class TestDelayFilter:
 
 class TestRarityBucket:
     def test_gem_bucket_contributes_low_popularity_fields(self):
-        """Among returned fields, some should have alphas below the median.
-        This proves the undiscovered-gems bucket is contributing."""
+        """미발굴(저인기) 필드가 팔레트에 실제로 섞여 들어와야 한다.
+
+        ⚠ '중앙값 **미만**' 으로 재면 안 된다 (2026-07-27). dataset.id 분할 수집으로
+        팔레트가 커지면서 GLB 는 29,343개 중 68%(20,032개)가 alphaCount=0 이 됐고,
+        그래서 전체 중앙값이 0 이다 — `alphas < 0` 은 성립할 수 없어 단정이 통과
+        불가능해진다. 의도는 '희소 필드가 들어오나' 이므로 **이하**로 잰다.
+        """
         import statistics as _stats
         result = dp.build_palette(n=55, seed=0)
         names = set(_palette_field_names(result))
@@ -160,10 +179,9 @@ class TestRarityBucket:
         assert returned_alphas
 
         overall_median = _stats.median(csv_alphas.values())
-        # At least some returned fields should be below median
-        below_median = sum(1 for a in returned_alphas if a < overall_median)
-        assert below_median > 0, \
-            f"Expected some fields below median alphas ({overall_median}), got 0"
+        at_or_below = sum(1 for a in returned_alphas if a <= overall_median)
+        assert at_or_below > 0, \
+            f"Expected some fields at/below median alphas ({overall_median}), got 0"
 
     def test_not_all_fields_are_high_popularity(self):
         """Palette should not be uniformly high-alphas (i.e., gems bucket works)."""
@@ -250,8 +268,13 @@ class TestLateCSVCoverage:
     """
 
     def _sorted_index(self, name: str) -> int:
-        """Return the index of `name` in the alphabetically-sorted field list."""
-        sorted_names = sorted(row['name'] for row in _all_csv_rows())
+        """Return the index of `name` in the alphabetically-sorted field list.
+
+        ⚠ **이름 기준으로 중복 제거**해야 한다. 합집합 소스에는 같은 필드가 D0·D1
+          두 행으로 들어 있어서, 중복을 안 지우면 여기서 센 위치와 build_palette 의
+          회전 오프셋이 어긋난다(2026-07-21 D0 팔레트 도입 때 실제로 어긋났다).
+        """
+        sorted_names = sorted({row['name'] for row in _usa_csv_rows()})
         try:
             return sorted_names.index(name)
         except ValueError:

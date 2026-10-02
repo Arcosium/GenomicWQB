@@ -2,229 +2,410 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <title>HYFE IQC</title>
+  <meta name="theme-color" content="#F5F1E8" />
+  <title>GenomicWQB</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@400;600;900&family=Noto+Sans+KR:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <style>
-    * { box-sizing: border-box; }
-    html, body { margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    /* GenomicWQB 모바일 — 종이/잉크 원장(Ledger) 테마 압축판. 데스크톱 style.css 와 동일 팔레트.
+       카드/필배지/글로우 없음 — 괘선 구획 + 단일 주묵(장부 적색) 액센트. */
+    :root {
+      --paper: #F5F1E8; --paper-dim: #EDE8DB;
+      --ink: #1C1914; --ink-soft: #4A443A; --ink-faint: #6E675A;
+      --rule: rgba(28,25,20,0.8); --hairline: rgba(28,25,20,0.18); --hairline-soft: rgba(28,25,20,0.1);
+      --red: #A63A22; --red-deep: #8C2F1A; --red-soft: #F0E2E0;
+      --ok: #3F6B45; --gold: #8C6D3B;
+      --o-rand: var(--ink); --o-mut: var(--gold); --o-xo: var(--ok);
+      --o-fix: var(--red-deep); --o-etc: var(--ink-faint);
+      --serif: 'Noto Serif KR', 'Apple SD Gothic Neo', serif;
+      --sans: 'Noto Sans KR', 'Apple SD Gothic Neo', sans-serif;
+      --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    [hidden] { display: none !important; }
+    html, body { margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-      background: #0f1115;
-      color: #e6e9ee;
-      min-height: 100vh;
-      display: flex; flex-direction: column;
+      font-family: var(--sans);
+      background: var(--paper); color: var(--ink);
+      min-height: 100vh; display: flex; flex-direction: column;
+      font-size: 14.5px; word-break: keep-all;
     }
-    header.topbar {
-      padding: 14px 18px;
-      display: flex; align-items: center; justify-content: space-between;
-      background: linear-gradient(180deg, #161922 0%, #11141b 100%);
-      border-bottom: 1px solid #1f2330;
-    }
-    header .brand { font-size: 16px; font-weight: 700; letter-spacing: 0.5px; }
-    header .brand .accent { color: #5fa8ff; }
-    header .who { font-size: 12px; color: #93a0b5; }
-    header .btn-logout {
-      background: none; border: 1px solid #2a3142; color: #9aa6bb;
-      border-radius: 6px; padding: 4px 10px; font-size: 12px;
-    }
-    main { flex: 1; padding: 16px; }
+    header.topbar, main { position: relative; z-index: 1; }
+    ::selection { background: rgba(166,58,34,0.22); }
+    :focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
 
-    /* 로그인 카드 */
+    header.topbar {
+      /* 상태바 겹침 방지: viewport-fit=cover 로 노출되는 안전영역 인셋만큼 위/좌우를 띄운다.
+         네이티브 셸이 이미 WebView 를 상태바 아래로 내렸으면 env()=0 이라 무해하고,
+         내리지 않았으면(구 APK·특정 기기) 여기서 상태바 아래로 내려준다. */
+      padding: calc(12px + env(safe-area-inset-top, 0px))
+               calc(16px + env(safe-area-inset-right, 0px))
+               12px
+               calc(16px + env(safe-area-inset-left, 0px));
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      background: var(--paper);
+      border-bottom: 1px solid var(--rule);
+      position: sticky; top: 0; z-index: 10;
+    }
+    .brand { line-height: 1.1; }
+    .brand-main { font-family: var(--serif); font-weight: 900; font-size: 16px; letter-spacing: 0.02em; text-transform: uppercase; }
+    .brand-main .accent { color: var(--red); }
+    .brand-sub { font-family: var(--mono); font-size: 8px; letter-spacing: 0.26em; color: var(--ink-faint); text-transform: uppercase; margin-top: 3px; }
+    .who { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .btn-logout {
+      background: none; border: 0; color: var(--red);
+      border-bottom: 1px solid transparent; padding: 4px 0; font-size: 12px; font-family: var(--mono);
+      letter-spacing: 0.04em;
+      white-space: nowrap; flex: none;
+    }
+    .btn-logout:active { border-bottom-color: var(--red); }
+    #user-row { display: flex; align-items: center; gap: 12px; }
+
+    main {
+      flex: 1;
+      padding: 14px calc(14px + env(safe-area-inset-right, 0px))
+               calc(34px + env(safe-area-inset-bottom, 0px))
+               calc(14px + env(safe-area-inset-left, 0px));
+      max-width: 560px; margin: 0 auto; width: 100%;
+    }
+
+    .micro {
+      font-family: var(--mono); font-size: 9.5px; font-weight: 500;
+      letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink-faint);
+    }
+
+    /* ── 로그인 카드 — 괘선으로만 구획, 배경 박스 없음 ── */
     .login-card {
-      max-width: 420px; margin: 24px auto;
-      background: #161922;
-      border: 1px solid #232838;
-      border-radius: 14px;
-      padding: 22px 18px 18px;
-      box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+      margin: 30px auto 0; max-width: 420px;
+      border-top: 2px solid var(--ink);
+      padding: 22px 2px 18px;
     }
-    .login-card h1 { font-size: 22px; margin: 0 0 6px; }
-    .login-card .sub { color: #9aa6bb; font-size: 13px; margin-bottom: 18px; }
-    .login-card label {
-      display: block; font-size: 13px; color: #b6c0d3;
-      margin-top: 12px;
-    }
+    .login-card h1 { font-family: var(--serif); font-weight: 900; font-size: 22px; margin: 0 0 6px; }
+    .login-card .sub { color: var(--ink-soft); font-size: 12.5px; margin-bottom: 18px; line-height: 1.55; }
+    .login-card label { display: block; font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); margin-top: 14px; }
     .login-card input {
-      width: 100%; margin-top: 4px;
-      background: #0f1218; color: #e6e9ee;
-      border: 1px solid #2a3142; border-radius: 8px;
-      padding: 12px 12px;
+      width: 100%; margin-top: 6px;
+      background: transparent; color: var(--ink);
+      border: 0; border-bottom: 1px solid var(--ink-soft); border-radius: 0;
+      padding: 12px 2px;
       font-size: 16px;     /* iOS zoom 방지 */
+      font-family: var(--mono);
+      min-height: 44px;
     }
-    .login-card input:focus { outline: 2px solid #2f78d6; border-color: transparent; }
+    .login-card input:focus { outline: none; border-bottom-color: var(--red); box-shadow: 0 1px 0 0 var(--red); }
     .login-card button[type=submit] {
-      margin-top: 18px; width: 100%;
-      background: #2f78d6; color: white; border: none;
-      border-radius: 10px; padding: 14px;
-      font-size: 16px; font-weight: 600;
+      margin-top: 20px; width: 100%;
+      background: var(--ink); color: var(--paper); border: 1px solid var(--ink); border-radius: 0;
+      padding: 14px; min-height: 44px;
+      font-size: 15px; font-weight: 700; font-family: var(--sans);
     }
     .login-card button:disabled { opacity: 0.5; }
-    .login-card .err {
-      margin-top: 12px; padding: 10px 12px;
-      border-radius: 8px; font-size: 13px;
-      background: #2a1a1f; color: #ff8d97; border: 1px solid #4d2730;
+    .err {
+      margin-top: 14px; padding: 10px 0 0; font-size: 12.5px;
+      color: var(--red-deep); border-top: 1px solid var(--hairline);
     }
-    .login-card .err:empty { display: none; }
-    .login-card .full-link {
-      display: block; margin-top: 16px; padding: 12px 14px;
-      text-align: center; font-size: 14px; font-weight: 600;
-      color: #e6e9ee; background: #2a3142; border: 1px solid #3a4259;
-      border-radius: 10px; text-decoration: none;
+    .err:empty { display: none; border: 0; }
+    .full-link {
+      display: block; margin-top: 16px; padding: 12px 0;
+      text-align: center; font-size: 13px; font-weight: 600; font-family: var(--mono);
+      letter-spacing: 0.04em;
+      color: var(--ink-soft); border-top: 1px solid var(--hairline);
+      border-radius: 0; text-decoration: none;
     }
-    .login-card .full-link:active { background: #20263a; }
-    .desktop-btn-row {
-      margin: 18px 0 6px; padding: 14px 12px;
-      background: #1a2030; border: 1px solid #2c3550; border-radius: 10px;
-      text-align: center;
+    .full-link:active { color: var(--red); }
+
+    /* ── 카드 공통(구 카드) — 괘선 구획으로 재해석, 배경/보더/그림자 없음 ── */
+    .mcard {
+      background: none; border: 0; border-radius: 0;
+      border-top: 1px solid var(--rule);
+      margin-bottom: 0; padding-bottom: 4px;
     }
-    .desktop-btn-row a {
-      display: inline-block; padding: 10px 18px;
-      background: #2f78d6; color: #fff; font-weight: 700; font-size: 14px;
-      border-radius: 8px; text-decoration: none;
+    .mcard-head {
+      display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+      padding: 14px 0 10px; border-bottom: 1px solid var(--rule); margin-bottom: 10px;
     }
-    .desktop-btn-row a:active { background: #2563b3; }
-    .desktop-btn-row .desktop-hint {
-      display: block; margin-top: 8px; color: #93a0b5; font-size: 11px;
+    .mcard-head h3 { margin: 0; font-family: var(--serif); font-weight: 700; font-size: 14.5px; }
+    .mcard-head .micro { margin-left: 2px; }
+    .mcard-head .tools { margin-left: auto; }
+
+    /* 접기/펼치기 — 헤더 클릭 토글, 헤더만 남기고 나머지 숨김 */
+    .mcard.collapsible .mcard-head { cursor: pointer; user-select: none; -webkit-user-select: none; }
+    .mcard-head .rs-chev { color: var(--ink-faint); font-size: 11px; margin-left: 4px; transition: transform 0.18s ease; flex: none; }
+    .mcard-head .rs-chev.tools { margin-left: auto; }   /* 헤더에 다른 도구가 없으면 오른쪽 끝 */
+    .mcard.collapsed .rs-chev { transform: rotate(-90deg); }
+    .mcard.collapsed > :not(.mcard-head) { display: none; }
+
+    /* ── 표 (제출 내역 · 제출 대기) — 좁은 화면에서 가로 스크롤 ── */
+    /* 30건이 그대로 펼쳐지면 폰에서 페이지가 통째로 길어진다 — 표 안에서만 스크롤. */
+    .mtable-wrap {
+      overflow: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+      max-height: 320px; padding-bottom: 10px;
+    }
+    .mpager { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; padding: 10px 0 2px; }
+    .mpager button {
+      font-family: var(--mono); font-size: 11px; min-width: 28px; padding: 5px 6px;
+      background: var(--paper); color: var(--ink-soft); border: 1px solid var(--hairline);
+    }
+    .mpager button.active { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .mpager .gap { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); padding: 0 2px; }
+    .mtable { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+    .mtable th {
+      font-family: var(--mono); font-size: 9px; font-weight: 500; letter-spacing: 0.1em;
+      text-transform: uppercase; color: var(--ink-faint); text-align: left;
+      padding: 5px 8px 5px 0; border-bottom: 1px solid var(--hairline); white-space: nowrap;
+    }
+    .mtable td {
+      padding: 7px 8px 7px 0; border-bottom: 1px solid var(--hairline-soft);
+      vertical-align: top; line-height: 1.4;
+    }
+    .mtable td.dim { color: var(--ink-faint); font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
+    .mtable td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; padding-right: 10px; }
+    .mtable td.wrap { word-break: break-all; }
+    .mtable td.ok { color: var(--ok); font-weight: 700; }
+    .mtable tr.alpha-row { cursor: pointer; }
+    .mtable tr.alpha-row:active { background: var(--paper-dim); }
+    .mtable tr.alpha-row:focus-visible { outline: 2px solid var(--red); outline-offset: -2px; }
+    .mtable td.alpha-expr {
+      width: 100%; font-family: var(--mono); font-size: 10.5px; color: var(--ink);
+      white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
     }
 
-    /* 상태 카드 */
-    .status-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      max-width: 540px; margin: 0 auto;
+    /* ── 차트 컨트롤 (데스크톱 seg-toggle 압축판) ── */
+    .chart-ctrl { display: flex; align-items: center; gap: 8px; padding: 0 0 4px; flex-wrap: wrap; }
+    .seg-toggle { display: inline-flex; border: 1px solid var(--hairline); }
+    .seg-toggle button {
+      font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.08em; padding: 5px 9px;
+      background: none; border: 0; color: var(--ink-faint); min-height: 30px;
     }
-    .stat {
-      background: #161922;
-      border: 1px solid #232838;
-      border-radius: 12px;
-      padding: 18px 16px;
-      min-height: 92px;
-      display: flex; flex-direction: column; justify-content: space-between;
-    }
-    .stat .label {
-      font-size: 12px; color: #93a0b5; text-transform: uppercase; letter-spacing: 0.6px;
-    }
-    .stat .value {
-      font-size: 28px; font-weight: 700; margin-top: 6px;
-      font-variant-numeric: tabular-nums;
-    }
-    .stat .sub { font-size: 11px; color: #6f7c91; margin-top: 4px; }
-
-    .stat.submitted { border-color: #2c5331; background: linear-gradient(180deg, #142a18 0%, #161922 80%); }
-    .stat.submitted .value { color: #6dde85; }
-    .stat.unsubmitted { border-color: #5a3722; background: linear-gradient(180deg, #2a1a12 0%, #161922 80%); }
-    .stat.unsubmitted .value { color: #f0a06f; }
-    .stat.errors .value { color: #f0a06f; }
-    .stat.current .value { color: #5fa8ff; }
-
-    .running-tag {
-      display: inline-block; margin-left: 6px;
-      padding: 1px 8px; font-size: 10px;
-      border-radius: 999px;
-      background: #1d3a26; color: #6dde85;
-      vertical-align: middle;
-    }
-    .running-tag.idle { background: #2a2f3d; color: #93a0b5; }
-    .running-tag.paused { background: #3d2c1d; color: #f0a06f; }
-
-    .updated-row {
-      max-width: 540px; margin: 12px auto 0;
-      text-align: right; font-size: 11px; color: #6f7c91;
+    .seg-toggle button.active { background: var(--ink); color: var(--paper); }
+    .chart-ctrl select {
+      font-family: var(--mono); font-size: 10.5px; color: var(--ink-soft);
+      background: var(--paper); border: 1px solid var(--hairline); border-radius: 0;
+      padding: 5px 6px; min-height: 30px; margin-left: auto;
     }
 
-    .footnote {
-      max-width: 540px; margin: 18px auto 0;
-      font-size: 11px; color: #6f7c91; line-height: 1.5;
-      text-align: center;
+    /* ── WQB biometric(Persona) 배너 ── 유일한 채움면(콜아웃) — 남용 금지.
+       이게 없어서 폰에서는 인증을 끝내도 세션을 저장할 방법이 없었다(사장 보고 2026-07-10). */
+    .persona-banner {
+      background: var(--red-soft); border: 0; border-left: 3px solid var(--red); border-radius: 0;
+      padding: 14px 15px; margin-bottom: 14px; font-size: 13px; line-height: 1.55; color: var(--ink);
     }
-    .footnote a { color: #7892b8; }
+    .persona-banner p { margin: 0 0 10px; }
+    .persona-banner a {
+      display: block; text-align: center; padding: 12px 12px; margin-bottom: 8px;
+      background: var(--ink); color: var(--paper); border-radius: 0;
+      font-weight: 700; text-decoration: none; min-height: 44px;
+    }
+    .persona-banner a[aria-disabled="true"] { opacity: .45; pointer-events: none; }
+    .persona-banner button {
+      width: 100%; padding: 12px 12px; border-radius: 0; font: inherit; font-weight: 700;
+      background: var(--ink); color: var(--paper);
+      border: 1px solid var(--ink); min-height: 44px;
+    }
+    .persona-banner button:disabled { opacity: .5; }
+    /* 재발급 = '직전 링크 무효화' 라는 대가가 있는 2차 동작 — 완료 저장과 구분한다. */
+    .persona-banner button.ghost {
+      background: transparent; color: var(--red-deep); border: 1px solid var(--red-deep);
+      margin-bottom: 8px; font-weight: 600;
+    }
+    #persona-status { display: block; margin-top: 8px; font-size: 12px; color: var(--ink-soft); }
+    .persona-hint { display: block; margin-top: 6px; font-size: 11.5px; color: var(--ink-soft); }
+    .persona-hint b { color: var(--ink); }
+    .persona-open {
+      width: 100%; padding: 11px 12px; margin-bottom: 12px; border-radius: 0;
+      font: inherit; font-weight: 600; background: transparent; color: var(--red-deep);
+      border: 1px solid var(--red-deep); min-height: 44px;
+    }
 
-    @media (min-width: 600px) {
-      .status-grid { grid-template-columns: repeat(4, 1fr); }
+    /* ── 히어로 (라운드 + run pill) ── */
+    .hero { padding: 18px 0 14px; display: flex; align-items: center; gap: 14px; border-top: 1px solid var(--rule); }
+    .hero .round-big { line-height: 1; }
+    .hero .round-big .n { font-family: var(--mono); font-size: 38px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .hero .round-big .cap { display: block; margin-bottom: 6px; }
+    .hero .hero-side { margin-left: auto; text-align: right; display: flex; flex-direction: column; gap: 7px; align-items: flex-end; }
+    .run-pill {
+      display: inline-flex; align-items: center; gap: 7px;
+      font-family: var(--mono); font-size: 10.5px; font-weight: 600; letter-spacing: 0.1em;
+      color: var(--ink-faint); text-transform: uppercase;
     }
+    .run-pill .dot { width: 7px; height: 7px; border-radius: 0; background: var(--ink-faint); }
+    .run-pill.is-running { color: var(--red); }
+    .run-pill.is-running .dot { background: var(--red); animation: pulse 1.8s ease-in-out infinite; }
+    .run-pill.is-paused { color: var(--gold); }
+    .run-pill.is-paused .dot { background: var(--gold); }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+    .hero-sub { font-size: 11px; color: var(--ink-faint); max-width: 170px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-    /* 제어 버튼 (시작 / 일시정지) */
-    .control-row {
-      max-width: 540px; margin: 0 auto 14px;
-      display: flex; gap: 10px;
-    }
+    .ctrl-row { display: flex; gap: 10px; padding: 0 0 16px; }
     .btn-ctrl {
-      flex: 1; padding: 14px;
-      border-radius: 10px; border: none;
-      font-size: 15px; font-weight: 600;
-      letter-spacing: 0.3px;
+      flex: 1; padding: 13px; border-radius: 0; border: 1px solid;
+      font-size: 14px; font-weight: 700; font-family: var(--sans); letter-spacing: 0.02em;
+      min-height: 44px;
     }
-    .btn-ctrl:disabled { opacity: 0.45; }
-    .btn-start { background: #2f78d6; color: white; }
-    .btn-start:active:not(:disabled) { background: #2563b3; }
-    .btn-pause { background: #2a3142; color: #c8d2e3; border: 1px solid #394157; }
-    .btn-pause:active:not(:disabled) { background: #20263a; }
-    .delay-row {
-      max-width: 540px; margin: 0 auto 14px;
-      display: flex; align-items: center; gap: 8px;
-      font-size: 13px; color: #9fb0c9;
-    }
-    .delay-row select {
-      background: #2a3142; color: #e6edf6; border: 1px solid #394157;
-      border-radius: 8px; padding: 8px 10px; font-size: 14px;
-    }
-    .delay-row #delay-mode-status { font-size: 12px; color: #6f7e96; }
+    .btn-ctrl:disabled { opacity: 0.4; }
+    .btn-start { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+    .btn-pause { background: transparent; color: var(--red); border-color: var(--red); }
 
-    /* 최근 알파 테이블 */
-    .recent-section {
-      max-width: 540px; margin: 24px auto 0;
+    /* ── 스탯 그리드 ── */
+    .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--rule); border-bottom: 1px solid var(--hairline); margin-bottom: 0; }
+    .stat {
+      border-left: 1px solid var(--hairline);
+      border-top: 2px solid var(--edge, transparent);
+      padding: 11px 12px 12px;
+      display: flex; flex-direction: column; gap: 4px;
     }
-    .recent-section h3 {
-      margin: 0; font-size: 13px; color: #93a0b5;
-      text-transform: uppercase; letter-spacing: 0.6px;
+    .stat:first-child { border-left: 0; }
+    .stat .value { font-family: var(--mono); font-size: 21px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--vink, var(--ink)); }
+    .stat.s-acc  { --edge: var(--red); --vink: var(--red); }
+    .stat.s-mut  { --edge: var(--o-mut); }
+    .stat.s-xo   { --edge: var(--o-xo); }
+    .stat.s-warn { --edge: var(--gold); --vink: var(--gold); }
+    .stat.s-plain{ --edge: var(--hairline); }
+
+    /* ── 진화 차트 ── */
+    .chart-wrap { position: relative; padding: 8px 2px 2px; }
+    #evo-chart { display: block; width: 100%; height: 190px; }
+    #evo-comp { display: block; width: 100%; height: 30px; margin-top: 2px; }
+    .legend-row { display: flex; gap: 13px; flex-wrap: wrap; padding: 8px 0 12px; }
+    .lg { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 10px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.03em; }
+    .lg .sw { width: 7px; height: 7px; border-radius: 0; }
+    .lg .sw.rand { background: var(--o-rand); } .lg .sw.mut { background: var(--o-mut); }
+    .lg .sw.xo { background: var(--o-xo); } .lg .sw.fix { background: var(--o-fix); }
+    .lg .sw.etc { background: var(--o-etc); }
+    /* 계보 선은 뿌리마다 hue 가 다르다 — 범례는 대표 3색을 겹쳐 "여러 갈래"임을 보인다(데스크톱과 동일). */
+    .lg .sw.lineage {
+      background: transparent; width: 14px; height: 0;
+      border-top: 2px solid hsl(200 38% 42%);
+      box-shadow: 0 3px 0 -1px hsl(90 38% 42%), 0 -3px 0 -1px hsl(340 38% 42%);
     }
-    .recent-head {
-      display: flex; align-items: center; justify-content: space-between;
-      margin: 0 0 8px;
+    .lg .sw.sub { background: transparent; border: 1.5px solid var(--ink); }
+    .evo-tip {
+      position: absolute; z-index: 5; pointer-events: none;
+      max-width: 240px;
+      background: var(--paper); border: 1px solid var(--rule); border-radius: 0;
+      padding: 9px 11px; font-size: 11.5px; line-height: 1.5;
+      display: none;
     }
-    .btn-clear-submits {
-      background: #2a3142; color: #9aa6bb; border: 1px solid #394157;
-      border-radius: 6px; padding: 5px 12px; font-size: 12px;
+    .evo-tip .h { font-family: var(--mono); font-weight: 600; margin-bottom: 3px; text-transform: uppercase; letter-spacing: 0.03em; }
+    .evo-tip .d { color: var(--ink-soft); }
+    .evo-tip .g { margin-top: 5px; font-family: var(--mono); font-size: 9.5px; color: var(--ink-faint); word-break: break-all; border-top: 1px solid var(--hairline); padding-top: 4px; }
+    .evo-empty { padding: 30px 14px; text-align: center; color: var(--ink-faint); font-size: 12px; }
+
+    /* ── 라이브 피드 ── */
+    .feed {
+      background: var(--paper-dim);
+      padding: 10px 12px 12px;
+      font-family: var(--mono); font-size: 11px; line-height: 1.5;
+      color: var(--ink-soft);
+      height: 340px; overflow-y: auto;
+      overscroll-behavior: contain;
+      border-top: 1px solid var(--hairline);
     }
-    .btn-clear-submits:active { background: #20263a; }
-    .btn-clear-submits:disabled { opacity: 0.5; }
-    #recent-table {
-      width: 100%; border-collapse: collapse;
-      background: #161922; border: 1px solid #232838; border-radius: 10px;
-      overflow: hidden; font-size: 12px;
-      font-variant-numeric: tabular-nums;
+    .log-line { display: flex; gap: 9px; padding: 1.5px 0; }
+    .log-line .ts {
+      flex: none; width: 50px; text-align: right;
+      color: var(--ink-faint); font-size: 9.5px; line-height: 1.75; user-select: none;
+      white-space: nowrap;
     }
-    #recent-table thead { background: #1d2230; }
-    #recent-table th, #recent-table td {
-      padding: 8px 6px; text-align: center;
-      border-bottom: 1px solid #1f2330;
+    .log-line .msg { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .log-line.lvl-warn .msg { color: var(--gold); }
+    .log-line.lvl-error .msg { color: var(--red-deep); }
+    .log-line.lvl-pass .msg { color: var(--ok); font-weight: 600; }
+    .feed.core-only .log-line.lvl-info { display: none; }
+    .log-divider { display: flex; align-items: center; gap: 8px; margin: 10px 0 6px; }
+    .log-divider .ld-chip {
+      flex: none; font-family: var(--mono); font-size: 9px; font-weight: 700; letter-spacing: 0.09em;
+      border: 1px solid currentColor; border-radius: 0; padding: 1.5px 8px; white-space: nowrap; text-transform: uppercase;
     }
-    #recent-table th { color: #93a0b5; font-weight: 600; font-size: 11px; }
-    #recent-table tbody tr:last-child td { border-bottom: none; }
-    .c-pass { color: #6dde85; }
-    .c-fail { color: #ff8d97; }
-    .c-err  { color: #f0a06f; }
-    .c-pend { color: #93a0b5; }
-    .badge-mini {
-      display: inline-block; padding: 1px 7px;
-      border-radius: 999px; font-size: 10px; font-weight: 600;
+    .log-divider .ld-sum {
+      flex: none; max-width: 55%;
+      color: var(--ink-soft); font-size: 9.5px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
-    .badge-mini.sub  { background: #163b1c; color: #6dde85; border: 1px solid #2c5331; }
-    .badge-mini.rej  { background: #3a2519; color: #f0a06f; border: 1px solid #5a3722; }
-    .badge-mini.errt { background: #2a1a1f; color: #ff8d97; border: 1px solid #4d2730; }
-    .badge-mini.dot     { background: #2a3142; color: #93a0b5; border: 1px solid #394157; }
-    .badge-mini.partial { background: #3a2f19; color: #f5d97f; border: 1px solid #5a4a22; }
-    #recent-table tr.row-partial { background: rgba(245, 217, 127, 0.04); }
-    .recent-empty {
-      padding: 14px; text-align: center; color: #6f7c91; font-size: 12px;
+    .log-divider .ld-line { flex: 1 1 8px; height: 1px; background: currentColor; opacity: 0.35; min-width: 8px; }
+    .log-divider.round-color-0 { color: var(--ink); }
+    .log-divider.round-color-1 { color: var(--red); }
+    .log-divider.round-color-2 { color: var(--ok); }
+    .log-divider.round-color-3 { color: var(--ink-faint); }
+    .log-divider.round-color-4 { color: var(--gold); }
+    .log-divider.round-color-5 { color: var(--red-deep); }
+    .core-toggle {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-family: var(--mono); font-size: 10.5px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em;
+    }
+    .core-toggle input { accent-color: var(--red); width: 15px; height: 15px; margin: 0; }
+    .recent-empty { padding: 16px; text-align: center; color: var(--ink-faint); font-size: 12px; }
+
+    /* ── 하단 ── */
+    .updated-row { text-align: right; font-family: var(--mono); font-size: 10.5px; color: var(--ink-faint); margin: 8px 2px 14px; }
+    .desktop-btn-row { text-align: center; margin-top: 8px; padding-top: 16px; border-top: 1px solid var(--rule); }
+    .desktop-btn-row a {
+      display: inline-block; padding: 11px 22px;
+      background: transparent; color: var(--ink); font-weight: 600; font-size: 13px; font-family: var(--mono); letter-spacing: 0.04em;
+      border: 1px solid var(--ink-soft); border-radius: 0; text-decoration: none;
+      min-height: 44px;
+    }
+    .desktop-btn-row a:active { border-color: var(--red); color: var(--red); }
+    .desktop-hint { display: block; margin-top: 8px; color: var(--ink-faint); font-size: 10.5px; }
+
+    /* ── 제출 알파 상세 ── */
+    .alpha-dlg {
+      width: min(720px, calc(100vw - 24px)); max-height: 90vh; padding: 0;
+      background: var(--paper); color: var(--ink); border: 1px solid var(--rule);
+      box-shadow: 0 18px 48px rgba(28, 25, 20, 0.24);
+    }
+    .alpha-dlg::backdrop { background: rgba(28, 25, 20, 0.42); }
+    .ad-head {
+      display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+      border-bottom: 1px solid var(--rule); position: sticky; top: 0;
+      background: var(--paper); z-index: 1;
+    }
+    .ad-head h3 { margin: 0; font-family: var(--serif); font-size: 15px; }
+    .ad-close {
+      margin-left: auto; min-height: 36px; padding: 7px 12px; background: transparent;
+      color: var(--ink); border: 1px solid var(--ink-soft); font-family: var(--mono);
+    }
+    .ad-body { padding: 14px; overflow: auto; max-height: calc(90vh - 62px); }
+    .ad-body h4 {
+      margin: 17px 0 7px; font-family: var(--mono); font-size: 10px;
+      letter-spacing: 0.14em; color: var(--ink-faint);
+    }
+    .ad-meta { display: grid; grid-template-columns: auto 1fr; gap: 5px 12px; margin: 0; font-size: 11px; }
+    .ad-meta dt { font-family: var(--mono); color: var(--ink-faint); }
+    .ad-meta dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+    .ad-stats {
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 14px;
+      margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hairline-soft);
+    }
+    .ad-stats span { display: flex; flex-direction: column; gap: 2px; }
+    .ad-stats em { font-style: normal; font-family: var(--mono); font-size: 9px; color: var(--ink-faint); }
+    .ad-stats b { font-family: var(--serif); font-size: 18px; }
+    .ad-code {
+      margin: 0; padding: 10px; background: var(--paper-dim); border: 1px solid var(--hairline-soft);
+      font-family: var(--mono); font-size: 11px; line-height: 1.55;
+      white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .ad-code.err { color: var(--red-deep); }
+    .ad-checks { display: flex; gap: 6px; flex-wrap: wrap; }
+    .ad-chip { font-family: var(--mono); font-size: 10px; padding: 3px 6px; border: 1px solid var(--hairline); }
+    .ad-chip.pass { color: var(--ok); border-color: rgba(63, 107, 69, 0.45); }
+    .ad-chip.fail { color: var(--red-deep); border-color: rgba(140, 47, 26, 0.45); background: var(--red-soft); }
+
+    @media (prefers-reduced-motion: reduce) {
+      .run-pill.is-running .dot { animation: none; }
+      * { transition: none !important; }
     }
   </style>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">HYFE <span class="accent">IQC</span></div>
+    <div class="brand">
+      <div class="brand-main">Genomic<span class="accent">WQB</span></div>
+      <div class="brand-sub">Evolution Observatory</div>
+    </div>
     <div id="user-row" hidden>
       <span class="who" id="user-name"></span>
       <button class="btn-logout" id="btn-logout" type="button">로그아웃</button>
@@ -235,7 +416,7 @@
     <!-- ── 로그인 ── -->
     <section id="screen-login" class="login-card">
       <h1>로그인</h1>
-      <div class="sub">WQB 아이디 + 비밀번호로 진행 상황만 확인합니다.</div>
+      <div class="sub">WQB 아이디 + 비밀번호로 진화 현황을 확인합니다.</div>
       <form id="form-login" autocomplete="on">
         <label>WQB 이메일
           <input type="email" id="username" autocomplete="username" required />
@@ -245,83 +426,180 @@
         </label>
         <button type="submit" id="btn-submit">접속</button>
         <div id="err" class="err"></div>
-        <a href="/?desktop=1" class="full-link">🖥 데스크톱 버전으로 보기</a>
+        <a href="/?desktop=1" class="full-link">데스크톱 버전으로 보기</a>
       </form>
     </section>
 
     <!-- ── 진행 상황 ── -->
     <section id="screen-status" hidden>
-      <div class="control-row">
-        <button id="btn-start" class="btn-ctrl btn-start">▶ 실행</button>
-        <button id="btn-pause" class="btn-ctrl btn-pause" disabled>⏸ 일시정지</button>
+
+      <!-- WQB biometric(Persona) — 데스크톱과 동일 -->
+      <div id="persona-banner" hidden class="persona-banner">
+        <p>이 RC 계정은 WQB biometric(Persona) 인증이 필요합니다.</p>
+        <a id="persona-link" href="#" target="_blank" rel="noopener">여기서 인증 완료하기 ↗</a>
+        <button type="button" id="btn-persona-renew" class="ghost">인증 링크 재발급</button>
+        <button type="button" id="btn-persona-complete">인증 완료했습니다 — 세션 저장</button>
+        <span id="persona-status"></span>
+        <span class="persona-hint">인증 페이지가 <b>만료(session expired)</b>로 뜨면 <b>인증 링크 재발급</b>을 누르세요. 이전 링크는 무효가 됩니다.</span>
       </div>
-      <div class="delay-row">
-        <label for="delay-mode">Delay 테스트</label>
-        <select id="delay-mode">
-          <option value="0">Delay=0</option>
-          <option value="1">Delay=1</option>
-          <option value="mix">혼합(랜덤)</option>
-        </select>
-        <span id="delay-mode-status"></span>
-      </div>
-      <div class="status-grid">
-        <div class="stat current">
-          <div class="label">현재 라운드 <span id="run-tag" class="running-tag idle">idle</span></div>
-          <div class="value" id="cur-round">—</div>
-          <div class="sub" id="cur-status"></div>
+      <!-- 배너가 숨겨져 있어도(세션이 유효해 보여도) 스스로 재인증에 들어갈 수 있는 진입점.
+           누른다고 WQB 호출이 나가지는 않는다 — 배너만 펼친다. -->
+      <button type="button" id="btn-persona-open" class="persona-open" hidden>WQB 인증 / 링크 재발급</button>
+
+      <!-- 히어로: 현재 라운드 + 제어 -->
+      <div class="mcard">
+        <div class="hero">
+          <div class="round-big">
+            <span class="micro cap">현재 라운드</span>
+            <span class="n" id="cur-round">—</span>
+          </div>
+          <div class="hero-side">
+            <span class="run-pill" id="run-pill"><span class="dot"></span><span id="run-tag">idle</span></span>
+            <span class="hero-sub" id="cur-status"></span>
+          </div>
         </div>
-        <div class="stat">
-          <div class="label">완료 라운드</div>
-          <div class="value" id="completed-round">0</div>
-        </div>
-        <div class="stat submitted">
-          <div class="label">Added</div>
-          <div class="value" id="submitted-count">0</div>
-          <div class="sub">리스트 추가</div>
-        </div>
-        <div class="stat unsubmitted">
-          <div class="label">Not added</div>
-          <div class="value" id="unsubmitted-count">0</div>
-          <div class="sub">미추가</div>
+        <div class="ctrl-row">
+          <button id="btn-start" class="btn-ctrl btn-start">진화 실행</button>
+          <button id="btn-pause" class="btn-ctrl btn-pause" disabled>일시정지</button>
         </div>
       </div>
+
+      <!-- 스탯 -->
+      <div class="stat-grid">
+        <div class="stat s-plain">
+          <span class="micro">완료 라운드</span>
+          <span class="value" id="completed-round">0</span>
+        </div>
+        <div class="stat s-acc">
+          <span class="micro">Added</span>
+          <span class="value" id="submitted-count">0</span>
+        </div>
+        <div class="stat s-warn">
+          <span class="micro">미추가</span>
+          <span class="value" id="unsubmitted-count">0</span>
+        </div>
+      </div>
+
+      <!-- ── 2026-07-30 사장 지시 순서 — 라이브 피드 → 제출 내역 → 제출 대기 → 진화 궤적.
+           전략 리서치 카드는 모바일에서 제거(데스크톱 '전략 리서치' 탭에만 있음).
+           아래 셋은 기본 접힘 — 폰에선 피드가 먼저 보여야 한다. ── -->
+
+      <!-- 라이브 피드 -->
+      <div class="mcard">
+        <div class="mcard-head">
+          <h3>라이브 피드</h3><span class="micro">Live</span>
+          <div class="tools">
+            <label class="core-toggle"><input type="checkbox" id="core-only" checked /> 핵심만</label>
+          </div>
+        </div>
+        <div id="feed" class="feed core-only"></div>
+        <div id="feed-empty" class="recent-empty" hidden>로그가 아직 없습니다.</div>
+      </div>
+
+      <!-- 제출 내역 -->
+      <div class="mcard collapsible" data-fold-key="sh" data-fold-default="closed">
+        <div class="mcard-head" role="button" tabindex="0" aria-expanded="false">
+          <h3>제출 내역</h3><span class="micro">Submitted</span>
+          <span class="tools micro" id="sh-count"></span>
+          <span class="rs-chev" aria-hidden="true">▾</span>
+        </div>
+        <div class="mtable-wrap">
+          <table class="mtable" id="sh-table">
+            <thead><tr><th>시각</th><th>라운드</th><th colspan="2">알파 식</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="recent-empty" id="sh-empty">아직 제출에 성공한 알파가 없습니다.</div>
+      </div>
+
+      <!-- 제출 대기 — 읽기 전용(제출·삭제는 데스크톱에서) -->
+      <div class="mcard collapsible" data-fold-key="sq" data-fold-default="closed">
+        <div class="mcard-head" role="button" tabindex="0" aria-expanded="false">
+          <h3>제출 대기</h3><span class="micro">Queue</span>
+          <span class="tools micro" id="sq-count"></span>
+          <span class="rs-chev" aria-hidden="true">▾</span>
+        </div>
+        <div class="mtable-wrap">
+          <table class="mtable" id="sq-table">
+            <thead><tr><th>종류</th><th>알파</th><th>Sharpe</th><th>Turn</th><th>상태</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="recent-empty" id="sq-empty">대기 중인 항목이 없습니다.</div>
+        <div class="mpager" id="sq-pager" hidden></div>
+      </div>
+
+      <!-- 진화 궤적 — 데스크톱과 동일(지표 토글·게이트선·계보선) -->
+      <div class="mcard collapsible" id="evo-card" data-fold-key="evo" data-fold-default="closed">
+        <div class="mcard-head" role="button" tabindex="0" aria-expanded="false">
+          <h3>진화 궤적</h3><span class="micro">Evolution Trace</span>
+          <span class="rs-chev tools" aria-hidden="true">▾</span>
+        </div>
+        <div class="chart-ctrl">
+          <div class="seg-toggle" id="evo-metric" role="radiogroup" aria-label="지표">
+            <button type="button" data-metric="sharpe" class="active">SHARPE</button>
+            <button type="button" data-metric="pass">PASS</button>
+          </div>
+          <select id="evo-range" aria-label="표시 범위">
+            <option value="200">최근 25 라운드</option>
+            <option value="400" selected>최근 50 라운드</option>
+            <option value="800">최근 100 라운드</option>
+          </select>
+        </div>
+        <div class="chart-wrap" id="chart-wrap">
+          <svg id="evo-chart"></svg>
+          <svg id="evo-comp"></svg>
+          <div class="evo-tip" id="evo-tip"></div>
+          <div class="evo-empty" id="evo-empty" hidden>아직 시뮬 데이터가 없습니다.</div>
+        </div>
+        <div class="legend-row">
+          <span class="lg"><span class="sw rand"></span>탐색 rand</span>
+          <span class="lg"><span class="sw mut"></span>변이 mut</span>
+          <span class="lg"><span class="sw xo"></span>교차 xo</span>
+          <span class="lg"><span class="sw fix"></span>개선 fix</span>
+          <span class="lg"><span class="sw etc"></span>기타</span>
+          <span class="lg"><span class="sw lineage"></span>계보</span>
+          <span class="lg"><span class="sw sub"></span>제출됨</span>
+        </div>
+        <div class="micro" style="padding:0 2px 12px">세대 구성 — 라운드별 탐색·변이·교차·개선 비율</div>
+      </div>
+
       <div class="updated-row">마지막 업데이트: <span id="updated-at">—</span></div>
 
-      <section class="recent-section">
-        <div class="recent-head">
-          <h3>최근 리스트 추가 시도</h3>
-          <button type="button" id="btn-clear-submits" class="btn-clear-submits">화면 비우기</button>
-        </div>
-        <table id="recent-table">
-          <thead>
-            <tr>
-              <th>R/#</th>
-              <th class="c-pass">PASS</th>
-              <th class="c-fail">FAIL</th>
-              <th>상태</th>
-              <th>시각</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-        <div id="recent-empty" class="recent-empty" hidden>리스트 추가 시도가 아직 없습니다.</div>
-      </section>
-
       <div class="desktop-btn-row">
-        <a href="/?desktop=1">🖥 데스크톱 버전으로 보기</a>
-        <span class="desktop-hint">상세 로그 / 워커 제어 / 모든 알파 보기</span>
+        <a href="/?desktop=1">데스크톱 버전으로 보기</a>
+        <span class="desktop-hint">상세 로그 · 파이프라인 · 세대 사다리 · 워커 제어</span>
       </div>
     </section>
   </main>
 
+  <dialog id="alpha-dlg" class="alpha-dlg">
+    <div class="ad-head">
+      <h3 id="ad-title">알파 상세</h3>
+      <button id="ad-close" class="ad-close" type="button">닫기</button>
+    </div>
+    <div class="ad-body" id="ad-body"></div>
+  </dialog>
+
   <script>
   (() => {
+    'use strict';
     const $ = (s) => document.querySelector(s);
     const screenLogin = $('#screen-login');
     const screenStatus = $('#screen-status');
     const userRow = $('#user-row');
     const userName = $('#user-name');
     let pollTimer = null;
+    let evoTimer = null;
+
+    const ORIGIN_COLOR = { rand: '#1C1914', mut: '#8C6D3B', xo: '#3F6B45', fix: '#8C2F1A', etc: '#6E675A' };
+    const ORIGIN_LABEL = { rand: '탐색', mut: '변이', xo: '교차', fix: '개선', etc: '기타' };
+    // alphas.origin → 버킷. desc 의 [rand|mut|xo] 태그는 옛 행 폴백이다.
+    // 새 오퍼레이터는 여기에 등록해야 한다 (app.js 의 ORIGIN_OP 와 같은 표).
+    const ORIGIN_OP = {
+      random: 'rand', spec: 'rand', mutate: 'mut', sweep: 'mut',
+      crossover: 'xo', combine: 'xo', ht_rescue: 'fix', improve: 'fix', hunt: 'fix',
+    };
 
     function show(loggedIn, who) {
       screenLogin.hidden = loggedIn;
@@ -346,28 +624,22 @@
     }
 
     function fmtRunTag(s) {
+      const pill = $('#run-pill');
       const tag = $('#run-tag');
       const running = !!s.running;
       const alive = !!s.thread_alive;
       const paused = !!s.paused || !!s.paused_in_memory;
-      tag.classList.remove('idle', 'paused');
-      if (running && alive && !paused) {
-        tag.textContent = '실행 중';
-      } else if (running && paused) {
-        tag.textContent = '일시정지';
-        tag.classList.add('paused');
-      } else if (alive) {
-        tag.textContent = '워커 살아있음';
-      } else {
-        tag.textContent = 'idle';
-        tag.classList.add('idle');
-      }
+      pill.classList.remove('is-running', 'is-paused');
+      if (running && alive && !paused) { tag.textContent = 'EVOLVING'; pill.classList.add('is-running'); }
+      else if (running && paused) { tag.textContent = 'PAUSED'; pill.classList.add('is-paused'); }
+      else if (alive) { tag.textContent = 'ALIVE'; }
+      else { tag.textContent = 'IDLE'; }
     }
 
     function applyStatus(s) {
       // focused sub-round 일 때 'N-M' 으로 표기 (예: 137-1).
       const lbl = s.current_round_label || (s.current_round != null ? String(s.current_round) : null);
-      $('#cur-round').textContent = lbl ? `#${lbl}` : '—';
+      $('#cur-round').textContent = lbl && lbl !== '—' ? `#${lbl}` : '—';
       $('#cur-status').textContent = s.current_status || '';
       $('#completed-round').textContent = String(s.last_round_num || 0);
       $('#submitted-count').textContent = String(s.submitted_count || 0);
@@ -384,84 +656,619 @@
       $('#updated-at').textContent = now.toLocaleTimeString('ko-KR', { hour12: false });
     }
 
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, (c) => (
-        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-      ));
+    // ── 라이브 피드 (XSS 안전 — textContent 만) ──
+    const feedEl = $('#feed');
+    let lastLogId = 0;
+    let logInit = false;
+    const seenLogIds = new Set();
+
+    function fmtLogTime(ts) {
+      // 고정폭 HH:MM:SS — ko-KR 의 "15시 39분 8초" 는 열이 깨진다.
+      return ts ? new Date(ts * 1000).toTimeString().slice(0, 8) : '';
+    }
+    function classifyLine(text, level) {
+      const lvl = (level || '').toLowerCase();
+      if (lvl === 'pass') return 'lvl-pass';
+      if (lvl === 'warn') return 'lvl-warn';
+      if (lvl === 'error') return 'lvl-error';
+      const t = text || '';
+      if (/🏆|best 발견/.test(t)) return 'lvl-pass';
+      // 텍스트 휴리스틱 경고(개별 fail 결과 등)는 색만 warn — 핵심만 모드에선 숨긴다.
+      if (/⚠|🛑|ERROR|error|예외|실패|fail/i.test(t)) return 'lvl-warn lvl-info';
+      return 'lvl-info';
+    }
+    function buildLogEl(row) {
+      if (row.level === 'round_start' || row.level === 'round_end') {
+        const root = document.createElement('div');
+        root.className = 'log-divider round-color-' + (Math.abs(Number(row.round_num) || 0) % 6);
+        const raw = String(row.line || '');
+        const t = raw.replace(/═+/g, '').trim();
+        const m = /^ROUND\s+(\S+)\s*([^—]*?)\s*(?:—\s*(.*))?$/.exec(t);
+        const chip = document.createElement('span');
+        chip.className = 'ld-chip';
+        chip.textContent = m ? ('ROUND ' + m[1] + (m[2] ? ' ' + m[2].trim() : '')) : (t || '—');
+        const l1 = document.createElement('span'); l1.className = 'ld-line';
+        const l2 = document.createElement('span'); l2.className = 'ld-line';
+        root.appendChild(l1);
+        root.appendChild(chip);
+        if (m && m[3]) {
+          const sum = document.createElement('span');
+          sum.className = 'ld-sum';
+          sum.textContent = m[3].replace(/\s*\/\s*/g, ' · ');
+          root.appendChild(sum);
+        }
+        root.appendChild(l2);
+        root.title = fmtLogTime(row.ts) + '  ' + raw;
+        return root;
+      }
+      const line = document.createElement('div');
+      line.className = 'log-line ' + classifyLine(row.line || '', row.level || '');
+      const ts = document.createElement('span');
+      ts.className = 'ts';
+      ts.textContent = fmtLogTime(row.ts);
+      const msg = document.createElement('span');
+      msg.className = 'msg';
+      msg.textContent = row.line || '';
+      line.appendChild(ts);
+      line.appendChild(msg);
+      return line;
     }
 
-    function fmtTime(ts) {
-      if (!ts) return '—';
-      try {
-        // 뷰어/서버 타임존 무관하게 항상 KST(Asia/Seoul) 로 표기.
-        return new Date(ts * 1000).toLocaleTimeString('en-GB', {
-          timeZone: 'Asia/Seoul', hour12: false,
-          hour: '2-digit', minute: '2-digit', second: '2-digit',
-        });
-      } catch (_) {
-        const d = new Date((ts + 9 * 3600) * 1000);  // UTC+9 수동 폴백
-        const z = (n) => String(n).padStart(2, '0');
-        return `${z(d.getUTCHours())}:${z(d.getUTCMinutes())}:${z(d.getUTCSeconds())}`;
+    async function refreshLogs() {
+      if (!feedEl) return;
+      if (!logInit) {
+        // 처음엔 최근 ~150줄만 tail — latest/비우기 지점은 status 가 알려준다.
+        const st = await api('/api/status');
+        if (!(st.ok && st.data && st.data.ok)) return;
+        lastLogId = Math.max(
+          Number(st.data.last_cleared_log_id || 0),
+          Number(st.data.latest_log_id || 0) - 150);
+        logInit = true;
       }
-    }
-    // XSS 안전: innerHTML 미사용 — 모든 동적 값은 textContent/.title 로만.
-    function mkCell(text, cls, title) {
-      const td = document.createElement('td');
-      td.textContent = (text == null ? '' : String(text));
-      if (cls) td.className = cls;
-      if (title) td.title = String(title);
-      return td;
-    }
-    function mkBadge(submitted, ss) {
-      const span = document.createElement('span');
-      let extra = 'dot', label = '—', title = ss || '리스트 추가 시도';
-      if (submitted) {                                  // 'Submit' 리스트 추가 성공
-        extra = 'sub'; label = '✅ 추가'; title = ss || 'Submit 리스트 추가';
-        const m = ss.match(/0?\.\d+/);
-        if (m && /corr/i.test(ss)) label = '✅ 추가 · corr ' + m[0];
-      } else if (ss.startsWith('skip_star')) {          // all-pass 아님 / corr>0.7 → 미추가
-        extra = 'dot'; label = '— 미추가';
-        const m = ss.match(/0?\.\d+/);
-        if (m && /corr/i.test(ss)) label = '— 미추가 · corr ' + m[0];
-        title = ss.slice(0, 90);
-      } else if (ss.startsWith('star_fail')) { extra = 'errt'; label = '⚠ 추가실패'; title = ss; }
-      else if (ss.startsWith('rejected:')) {            // (구버전 제출 기록 호환)
-        extra = 'rej'; label = '✗ 거절';
-        const body = ss.slice('rejected:'.length);
-        const m = body.match(/\d+\.\d+/);
-        if (m && /correlation/i.test(body)) label = '✗ 거절 · corr ' + m[0];
-        title = body.slice(0, 80);
-      } else if (ss.startsWith('fail:')) { extra = 'errt'; label = '⚠ 실패'; title = ss; }
-      else if (ss === 'disabled') { extra = 'dot'; label = '⛔ 비활성'; title = ss; }
-      else if (ss === 'not_found') { extra = 'errt'; label = '⚠ 못찾음'; title = ss; }
-      span.className = 'badge-mini ' + extra;
-      span.textContent = label;
-      span.title = title;
-      return span;
-    }
-    function renderRecent(rows) {
-      const tbody = document.querySelector('#recent-table tbody');
-      const empty = document.querySelector('#recent-empty');
-      tbody.replaceChildren();
-      if (!rows || rows.length === 0) {
-        empty.hidden = false;
-        document.querySelector('#recent-table').style.display = 'none';
+      const r = await api('/api/logs?since=' + lastLogId + '&limit=300');
+      if (!(r.ok && r.data && r.data.ok)) return;
+      const rows = r.data.logs || [];
+      if (!rows.length) {
+        $('#feed-empty').hidden = feedEl.childElementCount > 0;
         return;
       }
-      empty.hidden = true;
-      document.querySelector('#recent-table').style.display = '';
-      for (const a of rows) {
-        const tr = document.createElement('tr');
-        const ss = (a.submit_status || '');
-        tr.appendChild(mkCell(`R${a.round_num}/#${a.idx}`, null, (a.code || '').slice(0, 200)));
-        tr.appendChild(mkCell(a.pass_count || 0, 'c-pass'));
-        tr.appendChild(mkCell(a.fail_count || 0, 'c-fail'));
-        const bcell = document.createElement('td');
-        bcell.appendChild(mkBadge(!!a.submitted, ss));
-        tr.appendChild(bcell);
-        tr.appendChild(mkCell(fmtTime(a.ts), 'c-pend'));
-        tbody.appendChild(tr);
+      $('#feed-empty').hidden = true;
+      // 사용자가 위로 스크롤해 읽는 중이면 붙잡아두고, 바닥 근처면 따라간다.
+      const nearBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight < 60;
+      for (const row of rows) {
+        const id = Number(row.id);
+        if (Number.isFinite(id) && id > 0) {
+          if (seenLogIds.has(id)) continue;
+          seenLogIds.add(id);
+          if (id > lastLogId) lastLogId = id;
+        }
+        feedEl.appendChild(buildLogEl(row));
       }
+      while (feedEl.childElementCount > 600) feedEl.removeChild(feedEl.firstChild);
+      if (nearBottom) feedEl.scrollTop = feedEl.scrollHeight;
+    }
+
+    const coreOnlyEl = $('#core-only');
+    if (coreOnlyEl) {
+      coreOnlyEl.addEventListener('change', () => {
+        feedEl.classList.toggle('core-only', coreOnlyEl.checked);
+        feedEl.scrollTop = feedEl.scrollHeight;
+      });
+    }
+
+    // ── 진화 궤적 — 데스크톱 app.js renderEvolution() 이식 (2026-07-30 사장 지시).
+    //    지표 토글(SHARPE/PASS) · 제출 게이트 기준선 · 계보(부모→자식) 선까지 동일하게 그린다.
+    let _dots = [];
+    let _evoAlphas = [];
+    let _evoMetric = 'sharpe';
+    let _evoLimit = 400;
+    const GATE_SHARPE = 1.25, GATE_SHARPE_HI = 1.5;
+
+    function parseOrigin(a) {
+      const gen = Number(a.generation || 0);
+      const op = ORIGIN_OP[a.origin];
+      if (op) return { op, gen };
+      const m = /\[(rand|mut|xo)(?:\s*g(\d+))?\]/.exec(a.desc || '');
+      return m ? { op: m[1], gen: gen || Number(m[2] || 0) } : { op: 'etc', gen };
+    }
+    function sharpeOf(a) {
+      if (a.sharpe != null && isFinite(Number(a.sharpe))) return Number(a.sharpe);
+      const v = parseFloat(a.metrics && a.metrics.sharpe);
+      return isFinite(v) ? v : null;
+    }
+    function svgEl(tag, attrs) {
+      const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+      for (const k in attrs) el.setAttribute(k, attrs[k]);
+      return el;
+    }
+
+    // 계보 — parent_alpha_id 체인의 뿌리마다 색이 다르다(골든앵글 hue). 데스크톱과 동일.
+    let _byId = new Map(), _rootCache = new Map();
+    function indexLineage(alphas) {
+      _byId = new Map(alphas.map((a) => [Number(a.id), a]));
+      _rootCache = new Map();
+    }
+    function rootOf(id) {
+      if (_rootCache.has(id)) return _rootCache.get(id);
+      let cur = id;
+      for (let hop = 0; hop < 500; hop++) {   // 순환 방어
+        const p = Number((_byId.get(cur) || {}).parent_alpha_id || 0);
+        if (!p || !_byId.has(p)) break;
+        cur = p;
+      }
+      _rootCache.set(id, cur);
+      return cur;
+    }
+    function lineageColor(root) {
+      return `hsl(${Math.round((root * 137.508) % 360)} 38% 42%)`;
+    }
+
+    function groupRounds(alphas) {
+      // round_id 로 묶는다 (focus sub-round 는 round_num 이 같아도 round_id 가 다름).
+      const map = new Map();
+      for (const a of alphas) {
+        const key = a.round_id != null ? String(a.round_id) : `${a.round_num}/${a.phase || 0}`;
+        if (!map.has(key)) map.set(key, { key, roundNum: Number(a.round_num || 0),
+                                          phase: Number(a.phase || 0), alphas: [] });
+        map.get(key).alphas.push(a);
+      }
+      const groups = [...map.values()].sort((x, y) => Number(x.key) - Number(y.key));
+      if (groups.length > 1) groups.shift();   // limit 절단으로 부분 fetch 된 최고(最古) 그룹 제거
+      for (const g of groups) {
+        g.label = g.phase > 0 ? `${g.roundNum}·f${g.phase}` : String(g.roundNum);
+        g.alphas.sort((x, y) => Number(x.idx || 0) - Number(y.idx || 0));
+      }
+      return groups;
+    }
+
+    async function refreshEvo() {
+      const r = await api('/api/recent_alphas?limit=' + _evoLimit);
+      if (!(r.ok && r.data && r.data.ok)) return;
+      const rows = (r.data.alphas || []).slice();
+      rows.reverse();                          // 서버는 id DESC — 시간순 ASC 로.
+      _evoAlphas = rows;
+      indexLineage(rows);
+      renderEvo();
+    }
+
+    function renderEvo() {
+      const svg = $('#evo-chart');
+      const comp = $('#evo-comp');
+      const empty = $('#evo-empty');
+      if (!svg || !comp) return;
+      svg.replaceChildren();
+      comp.replaceChildren();
+      _dots = [];
+
+      const groups = groupRounds(_evoAlphas);
+      empty.hidden = groups.length > 0;
+      if (!groups.length) return;
+
+      // 접혀 있으면 폭 0 — 그리지 않고 펼치는 순간 다시 그린다. 폭을 임의값으로 때우면
+      // viewBox 와 실제 픽셀이 어긋나 툴팁 히트테스트가 빗나간다.
+      const W = svg.clientWidth;
+      const H = svg.clientHeight || 190;
+      if (!W) return;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      const mL = 34, mR = 10, mT = 10, mB = 16;
+      const plotW = W - mL - mR, plotH = H - mT - mB;
+      const n = groups.length;
+      const bw = plotW / n;
+
+      // ── y 도메인 — 지표에 따라 (데스크톱과 동일 규칙) ──
+      const metric = _evoMetric;
+      const val = (a) => metric === 'sharpe' ? sharpeOf(a)
+                                             : (a.pass_count != null ? Number(a.pass_count) : null);
+      let lo, hi;
+      if (metric === 'sharpe') {
+        let mn = 0, mx = 1;
+        for (const g of groups) for (const a of g.alphas) {
+          const v = val(a);
+          if (v == null) continue;
+          if (v < mn) mn = v;
+          if (v > mx) mx = v;
+        }
+        lo = Math.max(-4, Math.floor(mn * 2) / 2);
+        hi = Math.min(4, Math.ceil(mx * 2) / 2);
+        if (hi - lo < 1) hi = lo + 1;
+      } else {
+        lo = 0; hi = 7;
+        for (const g of groups) for (const a of g.alphas) {
+          const v = val(a);
+          if (v != null && v > hi) hi = v;
+        }
+      }
+      const y = (v) => mT + plotH - ((v - lo) / (hi - lo)) * plotH;
+      const xOf = (gi) => mL + (gi + 0.5) * bw;
+
+      // ── 그리드 + y축 눈금 ──
+      for (let t = 0; t <= 4; t++) {
+        const v = lo + (hi - lo) * (t / 4);
+        svg.appendChild(svgEl('line', { x1: mL, x2: W - mR, y1: y(v), y2: y(v),
+                                        stroke: 'rgba(28,25,20,0.1)', 'stroke-width': 1 }));
+        const lbl = svgEl('text', { x: mL - 6, y: y(v) + 3, 'text-anchor': 'end', fill: '#6E675A',
+                                    'font-size': 9, 'font-family': 'IBM Plex Mono, monospace' });
+        lbl.textContent = metric === 'sharpe' ? v.toFixed(1) : String(Math.round(v));
+        svg.appendChild(lbl);
+      }
+      if (metric === 'sharpe' && lo < 0 && hi > 0) {
+        svg.appendChild(svgEl('line', { x1: mL, x2: W - mR, y1: y(0), y2: y(0),
+                                        stroke: 'rgba(28,25,20,0.3)', 'stroke-width': 1,
+                                        'stroke-dasharray': '3 4' }));
+      }
+      // 제출 게이트 기준선 (1.25 gold / 1.5 ok) — "통과선에 얼마나 근접했나".
+      if (metric === 'sharpe') {
+        for (const [gv, col] of [[GATE_SHARPE, 'rgba(140,109,59,0.5)'],
+                                 [GATE_SHARPE_HI, 'rgba(63,107,69,0.5)']]) {
+          if (gv <= lo || gv >= hi) continue;
+          svg.appendChild(svgEl('line', { x1: mL, x2: W - mR, y1: y(gv), y2: y(gv),
+                                          stroke: col, 'stroke-width': 1, 'stroke-dasharray': '2 3' }));
+          const t = svgEl('text', { x: W - mR - 2, y: y(gv) - 3, 'text-anchor': 'end',
+                                    fill: col.replace(/,[^,]+\)$/, ',0.9)'), 'font-size': 8,
+                                    'font-family': 'IBM Plex Mono, monospace' });
+          t.textContent = gv.toFixed(2);
+          svg.appendChild(t);
+        }
+      }
+
+      // ── x축 라벨 ──
+      const step = Math.max(1, Math.ceil(n / 6));
+      for (let i = 0; i < n; i += step) {
+        const g = groups[i];
+        if (g.phase > 0) continue;
+        const lbl = svgEl('text', { x: xOf(i), y: H - 3, 'text-anchor': 'middle', fill: '#6E675A',
+                                    'font-size': 9, 'font-family': 'IBM Plex Mono, monospace' });
+        lbl.textContent = 'R' + g.roundNum;
+        svg.appendChild(lbl);
+      }
+
+      // ── 알파 산점 + 계보 선 (엣지가 점 아래 레이어) ──
+      const gEdges = svgEl('g', { 'stroke-linecap': 'round' });
+      const gDots = svgEl('g', {});
+      svg.appendChild(gEdges);
+      svg.appendChild(gDots);
+
+      const pos = new Map();
+      groups.forEach((g, gi) => {
+        const cnt = g.alphas.length;
+        g.alphas.forEach((a, ai) => {
+          const v = val(a);
+          if (v == null) return;
+          const o = parseOrigin(a);
+          const jitter = cnt > 1 ? ((ai / (cnt - 1)) - 0.5) * Math.min(bw * 0.55, 14) : 0;
+          const cx = xOf(gi) + jitter;
+          const cy = y(Math.max(lo, Math.min(hi, v)));
+          const submitted = !!a.submitted;
+          gDots.appendChild(svgEl('circle', {
+            cx: cx.toFixed(1), cy: cy.toFixed(1),
+            r: submitted ? 3.6 : 2.5,
+            fill: ORIGIN_COLOR[o.op] || ORIGIN_COLOR.etc,
+            'fill-opacity': submitted ? 1 : 0.8,
+            stroke: submitted ? '#1C1914' : '#F5F1E8',
+            'stroke-width': submitted ? 1.3 : 0.8,
+          }));
+          if (a.id != null) pos.set(Number(a.id), [cx, cy]);
+          _dots.push({ x: cx, y: cy, a, o, label: g.label });
+        });
+      });
+      // 부모→자식 엣지만 — 신규(rand·부모 화면 밖)는 선 없는 점 = 새 계보의 시작.
+      for (const d of _dots) {
+        const p = pos.get(Number(d.a.parent_alpha_id || 0));
+        if (!p) continue;
+        gEdges.appendChild(svgEl('line', {
+          x1: p[0].toFixed(1), y1: p[1].toFixed(1), x2: d.x.toFixed(1), y2: d.y.toFixed(1),
+          stroke: lineageColor(rootOf(Number(d.a.id))), 'stroke-width': 1.2, opacity: 0.6,
+        }));
+      }
+
+      // ── 세대 구성 스트립 (스캐터와 x 정렬) ──
+      const cW = comp.clientWidth || W;
+      const cH = comp.clientHeight || 30;
+      comp.setAttribute('viewBox', `0 0 ${cW} ${cH}`);
+      const cbw = (cW - mL - mR) / n;
+      const barW = Math.max(1.5, cbw - 1.5);
+      groups.forEach((g, gi) => {
+        const counts = { rand: 0, mut: 0, xo: 0, fix: 0, etc: 0 };
+        // 통째로 죽은 라운드(세션 만료 등)는 구성 막대를 세우지 않는다 — 위 산점도는
+        // 비어 있는데 막대만 꽉 차면 '알파가 나왔다'고 거짓말을 한다(2026-08-07).
+        for (const a of g.alphas) {
+          if ((a.error_text || '').trim()) continue;
+          counts[parseOrigin(a).op]++;
+        }
+        const total = g.alphas.length || 1;
+        let yCursor = cH - 2;
+        for (const op of ['rand', 'mut', 'xo', 'fix', 'etc']) {
+          if (!counts[op]) continue;
+          const h = (counts[op] / total) * (cH - 4);
+          yCursor -= h;
+          comp.appendChild(svgEl('rect', {
+            x: (mL + gi * cbw + 0.5).toFixed(1), y: yCursor.toFixed(1),
+            width: barW.toFixed(1), height: Math.max(1, h - 0.8).toFixed(1),
+            fill: ORIGIN_COLOR[op], 'fill-opacity': 0.75,
+          }));
+        }
+      });
+    }
+
+    // 지표 토글 · 표시 범위 — 데스크톱과 같은 컨트롤.
+    (function initEvoControls() {
+      const seg = $('#evo-metric');
+      if (seg) seg.addEventListener('click', (ev) => {
+        const btn = ev.target.closest('button[data-metric]');
+        if (!btn) return;
+        _evoMetric = btn.dataset.metric;
+        seg.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+        renderEvo();
+      });
+      const range = $('#evo-range');
+      if (range) range.addEventListener('change', () => {
+        _evoLimit = Number(range.value) || 400;
+        refreshEvo();
+      });
+      let t = null;
+      window.addEventListener('resize', () => {
+        if (t) clearTimeout(t);
+        t = setTimeout(renderEvo, 200);
+      });
+    })();
+
+    // 탭(터치) 툴팁 — 가장 가까운 점.
+    (function initTip() {
+      const wrap = $('#chart-wrap');
+      const tip = $('#evo-tip');
+      const svg = $('#evo-chart');
+      function onTap(ev) {
+        if (!_dots.length) return;
+        const pt = ev.touches && ev.touches[0] ? ev.touches[0] : ev;
+        const rect = svg.getBoundingClientRect();
+        const mx = pt.clientX - rect.left;
+        const my = pt.clientY - rect.top;
+        let best = null, bd = 26 * 26;
+        for (const d of _dots) {
+          const dx = d.x - mx, dy = d.y - my;
+          const dist = dx * dx + dy * dy;
+          if (dist < bd) { bd = dist; best = d; }
+        }
+        if (!best) { tip.style.display = 'none'; return; }
+        tip.replaceChildren();
+        const h = document.createElement('div');
+        h.className = 'h';
+        h.textContent = `R${best.label} #${best.a.idx} · ${ORIGIN_LABEL[best.o.op]}` + (best.o.gen ? ` g${best.o.gen}` : '');
+        const d1 = document.createElement('div');
+        d1.className = 'd';
+        const sh = sharpeOf(best.a);
+        d1.textContent = `Sharpe ${sh != null ? sh.toFixed(2) : '—'} · PASS ${best.a.pass_count || 0} · FAIL ${best.a.fail_count || 0}` + (best.a.submitted ? ' · 제출' : '');
+        const g = document.createElement('div');
+        g.className = 'g';
+        g.textContent = best.a.desc || '';
+        tip.appendChild(h); tip.appendChild(d1); tip.appendChild(g);
+        const wrapRect = wrap.getBoundingClientRect();
+        tip.style.display = 'block';
+        const tw = tip.offsetWidth || 200;
+        const px = best.x + (rect.left - wrapRect.left);
+        const py = best.y + (rect.top - wrapRect.top);
+        tip.style.left = Math.max(4, Math.min(px - tw / 2, wrapRect.width - tw - 6)) + 'px';
+        tip.style.top = Math.max(4, py - tip.offsetHeight - 12) + 'px';
+        setTimeout(() => { tip.style.display = 'none'; }, 3500);
+      }
+      wrap.addEventListener('click', onTap);
+    })();
+
+    // ── 제출 내역 · 제출 대기 (2026-07-30 — 모바일에서 전략 리서치 자리를 대신한다) ──
+    const _td = (txt, cls) => {
+      const c = document.createElement('td');
+      if (cls) c.className = cls;
+      c.textContent = txt == null ? '' : String(txt);
+      return c;
+    };
+    const _num = (v) => { const f = parseFloat(v); return Number.isFinite(f) ? f.toFixed(2) : '—'; };
+
+    const itemName = (x) => (typeof x === 'string' ? x : (x && (x.name || x.title)) || String(x));
+    const numOrNull = (v) => {
+      if (v == null || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    function metricOf(a, key) {
+      const direct = numOrNull(a && a[key]);
+      return direct != null ? direct : numOrNull(a && a.metrics && a.metrics[key]);
+    }
+    function checkValues(a, name) {
+      const m = a.metrics || {};
+      const k = String(name || '').replace(/^(LOW|HIGH|IS)_/, '').toLowerCase();
+      return {
+        v: m[k] != null ? m[k] : m[k + '_check'],
+        c: m[k + '_cutoff'] != null ? m[k + '_cutoff'] : m[k + '_check_cutoff'],
+      };
+    }
+
+    function makeAlphaRow(tr, code) {
+      if (!code) return;
+      tr.classList.add('alpha-row');
+      tr.tabIndex = 0;
+      tr.title = '클릭 — 알파 상세';
+      const open = () => openAlphaRef(code);
+      tr.addEventListener('click', open);
+      tr.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); open(); }
+      });
+    }
+
+    async function openAlphaRef(code) {
+      const r = await api('/api/alpha?code=' + encodeURIComponent(code || ''));
+      if (r.ok && r.data && r.data.ok && r.data.alpha) {
+        openAlphaDetail(r.data.alpha);
+        return;
+      }
+      alert('이 알파의 상세 기록을 찾지 못했습니다 — 코드가 지워졌거나 다른 계정 기록입니다.');
+    }
+
+    function openAlphaDetail(a) {
+      const dlg = $('#alpha-dlg');
+      const body = $('#ad-body');
+      if (!dlg || !body) return;
+      const o = parseOrigin(a);
+      const wid = (a.metrics || {}).wqb_alpha_id || '';
+      $('#ad-title').textContent = `R${a.round_num || a.round || 0}${a.phase ? '·f' + a.phase : ''} #${a.idx || 0}`
+        + ` · ${ORIGIN_LABEL[o.op]}${o.gen ? ' g' + o.gen : ''}`;
+      body.replaceChildren();
+
+      const dl = document.createElement('dl');
+      dl.className = 'ad-meta';
+      const meta = [
+        ['알파 ID', String(a.id ?? '—')],
+        ['WQB ID', wid || '— (시뮬 실패/캐시)'],
+        ['부모', a.parent_alpha_id ? `#${a.parent_alpha_id}` : '— (신규 계보)'],
+        ['세대', String(a.generation ?? 0)],
+        ['설정', `${a.universe || '—'} × ${a.neutralization || '—'}`
+          + (a.decay != null ? ` · decay ${a.decay}` : '')
+          + (a.delay != null ? ` · D${a.delay}` : '')],
+        ['상태', a.submitted ? '제출됨' : (a.submit_status || (a.cached ? '캐시' : '미제출'))],
+      ];
+      for (const [key, value] of meta) {
+        const dt = document.createElement('dt'); dt.textContent = key;
+        const dd = document.createElement('dd'); dd.textContent = value;
+        dl.append(dt, dd);
+      }
+      body.appendChild(dl);
+
+      const stats = [
+        ['Sharpe', metricOf(a, 'sharpe'), (v) => v.toFixed(2)],
+        ['Fitness', metricOf(a, 'fitness'), (v) => v.toFixed(2)],
+        ['Turnover', metricOf(a, 'turnover'), (v) => (v * 100).toFixed(1) + '%'],
+        ['Self-corr', metricOf(a, 'self_corr'), (v) => v.toFixed(2)],
+      ];
+      const stat = document.createElement('div');
+      stat.className = 'ad-stats';
+      for (const [label, value, fmt] of stats) {
+        const box = document.createElement('span');
+        const em = document.createElement('em'); em.textContent = label;
+        const b = document.createElement('b'); b.textContent = value == null ? '—' : fmt(value);
+        box.append(em, b); stat.appendChild(box);
+      }
+      body.appendChild(stat);
+
+      const codeH = document.createElement('h4'); codeH.textContent = '알파 식';
+      const pre = document.createElement('pre'); pre.className = 'ad-code'; pre.textContent = a.code || '—';
+      body.append(codeH, pre);
+
+      for (const [title, items, cls] of [['PASS', a.pass_items || [], 'pass'], ['FAIL', a.fail_items || [], 'fail']]) {
+        const h = document.createElement('h4'); h.textContent = `${title} (${items.length})`;
+        const box = document.createElement('div'); box.className = 'ad-checks';
+        if (!items.length) {
+          const empty = document.createElement('span'); empty.className = 'micro'; empty.textContent = '— 없음';
+          box.appendChild(empty);
+        }
+        for (const item of items) {
+          const name = itemName(item);
+          const { v, c } = checkValues(a, name);
+          const chip = document.createElement('span'); chip.className = 'ad-chip ' + cls;
+          chip.textContent = name + (v != null ? ` ${v}` : '') + (c != null ? ` / 컷 ${c}` : '');
+          box.appendChild(chip);
+        }
+        body.append(h, box);
+      }
+
+      if (a.error_text) {
+        const h = document.createElement('h4'); h.textContent = '오류';
+        const err = document.createElement('pre'); err.className = 'ad-code err'; err.textContent = a.error_text;
+        body.append(h, err);
+      }
+      if (!dlg.open) dlg.showModal();
+    }
+
+    (function initAlphaDialog() {
+      const dlg = $('#alpha-dlg');
+      if (!dlg) return;
+      $('#ad-close').addEventListener('click', () => dlg.close());
+      dlg.addEventListener('click', (ev) => { if (ev.target === dlg) dlg.close(); });
+    })();
+
+    function fillTable(id, rows, emptyId, countId, buildRow) {
+      const table = $(id);
+      if (!table) return;
+      const tbody = table.querySelector('tbody');
+      tbody.replaceChildren();
+      const empty = $(emptyId);
+      if (empty) empty.hidden = rows.length > 0;
+      table.hidden = !rows.length;
+      const cnt = $(countId);
+      if (cnt) cnt.textContent = rows.length ? String(rows.length) + '건' : '';
+      for (const r of rows) tbody.appendChild(buildRow(r));
+    }
+
+    async function refreshSubmits() {
+      const r = await api('/api/m_submits?limit=30');
+      if (!(r.ok && r.data && r.data.ok)) return;
+      const rows = (r.data.attempts || []).filter((a) => a.submitted);
+      fillTable('#sh-table', rows, '#sh-empty', '#sh-count', (a) => {
+        const tr = document.createElement('tr');
+        const t = a.ts ? new Date(a.ts * 1000) : null;
+        tr.appendChild(_td(t ? `${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')} ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}` : '—', 'dim'));
+        tr.appendChild(_td(`r${a.round_num}${a.idx ? '-#' + a.idx : ''}`, 'dim'));
+        const expr = _td(a.code || '—', 'alpha-expr');
+        expr.colSpan = 2;
+        tr.appendChild(expr);
+        makeAlphaRow(tr, a.code);
+        return tr;
+      });
+    }
+
+    const SQ_STATUS = { pending: '대기', submitting: '제출 중…', submitted: '✅ 제출됨',
+                        rejected: '거절됨' };
+
+    // 쪽 번호 목록(0-based, null = …) — app.js 의 pageItems 와 같은 함수. 고치면 같이 고칠 것.
+    function pageItems(cur, pages) {
+      if (pages <= 10) return Array.from({ length: pages }, (_, i) => i);
+      const s = Math.max(0, Math.min(cur - 4, pages - 9)), e = s + 8;
+      const out = Array.from({ length: 9 }, (_, i) => s + i);
+      if (s > 0) out.unshift(...(s > 1 ? [0, null] : [0]));
+      if (e < pages - 1) out.push(...(e < pages - 2 ? [null, pages - 1] : [pages - 1]));
+      return out;
+    }
+
+    const SQ_PAGE = 10;
+    let sqRows = [], sqPage = 0;
+
+    async function refreshQueue() {
+      const r = await api('/api/submit_queue');
+      if (!(r.ok && r.data && r.data.ok)) return;
+      sqRows = r.data.rows || [];
+      renderQueue();
+    }
+
+    function renderQueue() {
+      const pages = Math.max(1, Math.ceil(sqRows.length / SQ_PAGE));
+      sqPage = Math.min(sqPage, pages - 1);
+      const pager = $('#sq-pager');
+      if (pager) {
+        pager.replaceChildren();
+        pager.hidden = pages <= 1;
+        for (const p of pages > 1 ? pageItems(sqPage, pages) : []) {
+          const el = document.createElement(p == null ? 'span' : 'button');
+          el.textContent = p == null ? '…' : String(p + 1);
+          if (p == null) el.className = 'gap';
+          else {
+            el.type = 'button';
+            if (p === sqPage) el.className = 'active';
+            el.addEventListener('click', () => { sqPage = p; renderQueue(); });
+          }
+          pager.appendChild(el);
+        }
+      }
+      fillTable('#sq-table', sqRows.slice(sqPage * SQ_PAGE, (sqPage + 1) * SQ_PAGE),
+                '#sq-empty', '#sq-count', (row) => {
+        const tr = document.createElement('tr');
+        const m = row.metrics || {};
+        tr.appendChild(_td(row.kind === 'theme' ? '🎯 테마' : '📆 예산', 'dim'));
+        tr.appendChild(_td(row.wqb_alpha_id, 'dim'));
+        tr.appendChild(_td(_num(m.sharpe), 'num'));
+        tr.appendChild(_td(m.turnover != null ? (Number(m.turnover) * 100).toFixed(0) + '%' : '—', 'num'));
+        tr.appendChild(_td(SQ_STATUS[row.status] || row.status));
+        return tr;
+      });
+      const cnt = $('#sq-count');
+      if (cnt) cnt.textContent = sqRows.length ? sqRows.length + '건' : '';
     }
 
     async function refresh() {
@@ -474,42 +1281,25 @@
       if (r.ok && r.data && r.data.ok) {
         applyStatus(r.data);
       }
-      try {
-        const r2 = await api('/api/m_submits?limit=30');
-        if (r2.ok && r2.data && r2.data.ok) {
-          renderRecent(r2.data.attempts || []);
-        }
-      } catch (_) {}
+      try { await refreshLogs(); } catch (_) {}
+    }
+
+    function refreshLists() {
+      refreshSubmits().catch(() => {});
+      refreshQueue().catch(() => {});
     }
 
     function startPolling() {
       stopPolling();
       refresh();
+      refreshEvo();
+      refreshLists();
       pollTimer = setInterval(refresh, 5000);
-      try { initDelayMode(); } catch (e) { console.error('initDelayMode', e); }
+      evoTimer = setInterval(() => { refreshEvo(); refreshLists(); }, 30000);
     }
-    function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
-
-    // ── Delay 테스트 모드 ──
-    let _delayInit = false;
-    const DELAY_LABELS = { '0': 'Delay=0 만', '1': 'Delay=1 만', 'mix': '혼합(랜덤)' };
-    async function initDelayMode() {
-      const sel = $('#delay-mode'), st = $('#delay-mode-status');
-      if (!sel) return;
-      const r = await api('/api/delay_mode');
-      if (r.ok && r.data && r.data.ok) {
-        sel.value = r.data.mode;
-        if (st) st.textContent = '현재: ' + (DELAY_LABELS[r.data.mode] || r.data.mode);
-      }
-      if (_delayInit) return;        // change 리스너는 한 번만 등록
-      _delayInit = true;
-      sel.addEventListener('change', async () => {
-        if (st) st.textContent = '저장 중…';
-        const res = await api('/api/delay_mode', { method: 'POST', body: { mode: sel.value } });
-        if (res.ok && res.data && res.data.ok) {
-          if (st) st.textContent = '저장됨: ' + (DELAY_LABELS[res.data.mode] || res.data.mode) + ' (다음 라운드)';
-        } else if (st) { st.textContent = '저장 실패'; }
-      });
+    function stopPolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (evoTimer) { clearInterval(evoTimer); evoTimer = null; }
     }
 
     $('#form-login').addEventListener('submit', async (e) => {
@@ -529,6 +1319,7 @@
       }
       show(true, r.data.wqb_username || u);
       startPolling();
+      checkPersonaStatus();
     });
 
     $('#btn-logout').addEventListener('click', async () => {
@@ -536,6 +1327,40 @@
       await api('/api/logout', { method: 'POST' });
       show(false);
     });
+
+    // 전략 리서치 카드 접기/펼치기 (localStorage 로 상태 유지)
+    // 카드 접기/펼치기 — .mcard.collapsible[data-fold-key] 전부. 상태는 localStorage.
+    // data-fold-default="closed" 면 기본 접힘(2026-07-30: 피드 아래 카드 전부 접고 시작).
+    (function initCollapsibles() {
+      document.querySelectorAll('.mcard.collapsible[data-fold-key]').forEach((card) => {
+        const head = card.querySelector('.mcard-head');
+        if (!head) return;
+        const key = 'mfold-' + card.dataset.foldKey;
+        const setCollapsed = (c) => {
+          card.classList.toggle('collapsed', c);
+          head.setAttribute('aria-expanded', String(!c));
+          try { localStorage.setItem(key, c ? '1' : '0'); } catch (e) {}
+          // 접혀 있는 동안 그린 SVG 는 폭 0 — 펼치는 순간 다시 그린다.
+          if (!c && card.id === 'evo-card') { try { renderEvo(); } catch (e) {} }
+        };
+        let start = card.dataset.foldDefault === 'closed';
+        try {
+          const saved = localStorage.getItem(key);
+          if (saved === '1') start = true;
+          else if (saved === '0') start = false;
+        } catch (e) {}
+        setCollapsed(start);
+        const toggle = () => setCollapsed(!card.classList.contains('collapsed'));
+        head.addEventListener('click', (e) => {
+          if (e.target.closest('button, select, input, label, a, textarea')) return;
+          toggle();
+        });
+        head.addEventListener('keydown', (e) => {
+          if (e.target !== head) return;
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+        });
+      });
+    })();
 
     $('#btn-start').addEventListener('click', async () => {
       const b = $('#btn-start'); b.disabled = true;
@@ -555,14 +1380,123 @@
       refresh();
     });
 
-    $('#btn-clear-submits').addEventListener('click', async () => {
-      const b = $('#btn-clear-submits'); b.disabled = true;
-      try {
-        await api('/api/m_submits/clear', { method: 'POST' });
-        renderRecent([]);   // 즉시 비움 (다음 polling 때 비우기 지점 반영됨)
-      } catch (_) {}
-      b.disabled = false;
-      refresh();
+    // ── WQB biometric(Persona) ─────────────────────────────────────────────
+    // ⚠ 대시보드 진입 시 **한 번만** 호출한다. /wqb-persona-status 는 세션·pending 이 둘 다
+    // 없으면 WQB 로 POST /authentication 을 날린다 — 폴링하면 BIOMETRICS_THROTTLED(429) 가
+    // 영구 재무장된다. 주기 확인이 필요하면 passive 한 /wqb-persona-watch 를 쓸 것.
+    //
+    // ⚠ 인증 링크는 여기서 미리 받아두지 않는다. 링크 발급은 inquiry 를 재개시켜 직전
+    // Persona 세션을 무효화하므로, 미리 받아두면 사용자가 그 링크를 여는 사이 다른 조회가
+    // 링크를 갈아치워 페이지가 무한 새로고침된다. 누르는 순간 /wqb-persona-link 로 받는다.
+    const personaBanner = $('#persona-banner');
+    const personaLink = $('#persona-link');
+    const personaStatus = $('#persona-status');
+    const btnPersonaComplete = $('#btn-persona-complete');
+    const btnPersonaRenew = $('#btn-persona-renew');
+    const btnPersonaOpen = $('#btn-persona-open');
+    let personaInquiry = '';
+
+    // 배너가 숨겨졌을 때만 RC 계정에 재인증 진입점을 노출한다(배너가 이미 떠 있으면 중복).
+    function syncPersonaOpenBtn(d) {
+      if (!btnPersonaOpen) return;
+      const isRc = !!(d && d.account_type === 'research_consultant');
+      btnPersonaOpen.hidden = !isRc || !personaBanner.hasAttribute('hidden');
+    }
+
+    async function checkPersonaStatus() {
+      const r = await api('/api/account/wqb-persona-status');
+      const d = r && r.data;
+      if (!d) return;
+      if (d.rate_limited) {
+        // 새로고침을 권하지 말 것 — 재인증 POST 가 나가 throttle 이 다시 걸린다.
+        personaStatus.textContent = 'WQB 인증 throttle — 새로고침하지 마세요. 잠시 기다리면 자동 해제됩니다.';
+        btnPersonaComplete.disabled = true;
+        personaLink.setAttribute('aria-disabled', 'true');
+        personaBanner.removeAttribute('hidden');
+      } else if (d.persona_required) {
+        personaInquiry = d.inquiry || '';
+        // authenticated=true 면 만료 전 선인증 창(만료 30분 전 알림) — 지금 인증하면 끊김이 없다.
+        personaStatus.textContent = d.authenticated
+          ? '세션이 아직 유효합니다 — 지금 인증해 두면 만료 시 끊김 없이 이어집니다.'
+          : '';
+        personaLink.removeAttribute('aria-disabled');
+        btnPersonaComplete.disabled = false;
+        personaBanner.removeAttribute('hidden');
+      } else {
+        personaInquiry = '';
+        personaBanner.setAttribute('hidden', '');
+      }
+      syncPersonaOpenBtn(d);
+    }
+
+    // force=true — 저장된 challenge 를 버리고 새로 발급한다. 열어 둔 인증 페이지가
+    // 'session expired' 로 죽었을 때의 탈출구(직전 링크는 무효가 된다).
+    async function requestPersonaLink(force) {
+      personaLink.setAttribute('aria-disabled', 'true');
+      if (btnPersonaRenew) btnPersonaRenew.disabled = true;
+      personaStatus.textContent = force ? '새 인증 링크 발급 중… (이전 링크는 무효)' : '인증 링크 발급 중…';
+      const r = await api('/api/account/wqb-persona-link',
+                          { method: 'POST', body: force ? { force: true } : {} });
+      const d = (r && r.data) || {};
+      personaLink.removeAttribute('aria-disabled');
+      if (btnPersonaRenew) btnPersonaRenew.disabled = false;
+      if (d.authenticated) {
+        personaStatus.textContent = '이미 인증되어 있습니다.';
+        personaBanner.setAttribute('hidden', '');
+        return;
+      }
+      const url = d.persona_url || '';
+      if (!url.includes('withpersona.com')) {
+        personaStatus.textContent = d.detail || '링크를 준비 중입니다 — 잠시 후 다시 눌러주세요.';
+        return;
+      }
+      if (d.inquiry) personaInquiry = d.inquiry;
+      personaStatus.textContent = (force ? '새 인증 링크를 열었습니다. ' : '')
+        + '인증을 마친 뒤 아래 버튼을 눌러 세션을 저장하세요.';
+      // WebView 는 multiple-window 미지원 → window.open 이 null 이면 현재 창을 넘긴다
+      // (shouldOverrideUrlLoading 이 외부 브라우저로 보낸다).
+      const w = window.open(url, '_blank', 'noopener');
+      if (!w) location.href = url;
+    }
+
+    personaLink.addEventListener('click', (ev) => {
+      ev.preventDefault();   // href 는 항상 '#' — 링크는 지금 받아온다.
+      if (personaLink.getAttribute('aria-disabled') === 'true') return;
+      requestPersonaLink(false);
+    });
+
+    if (btnPersonaRenew) btnPersonaRenew.addEventListener('click', () => {
+      if (btnPersonaRenew.disabled) return;
+      if (!confirm('새 인증 링크를 발급합니다.\n이미 열어 둔 인증 페이지는 무효가 됩니다. 계속할까요?')) return;
+      requestPersonaLink(true);
+    });
+
+    if (btnPersonaOpen) btnPersonaOpen.addEventListener('click', () => {
+      personaBanner.removeAttribute('hidden');
+      btnPersonaOpen.hidden = true;
+      personaLink.removeAttribute('aria-disabled');
+      btnPersonaComplete.disabled = false;
+      if (!personaStatus.textContent) personaStatus.textContent =
+        '인증 페이지를 열어 완료한 뒤 세션을 저장하세요. 링크가 만료됐으면 재발급을 누르세요.';
+      personaBanner.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    });
+
+    btnPersonaComplete.addEventListener('click', async () => {
+      btnPersonaComplete.disabled = true;
+      personaStatus.textContent = '저장 중…';
+      const r = await api('/api/account/wqb-persona-complete', {
+        method: 'POST', body: { inquiry: personaInquiry },
+      });
+      if (r.ok && r.data && r.data.ok) {
+        personaStatus.textContent = '인증 완료 — 세션 저장됨';
+        personaBanner.setAttribute('hidden', '');
+      } else {
+        personaStatus.textContent = '오류: ' + (
+          r.data && r.data.ok === false
+            ? 'biometric 인증이 아직 완료되지 않았습니다 — 브라우저에서 완료 후 다시 눌러주세요.'
+            : ((r.data && (r.data.detail || r.data.reason)) || '알 수 없는 오류'));
+        btnPersonaComplete.disabled = false;
+      }
     });
 
     // 자동 로그인 시도 — 쿠키가 있으면 바로 status 화면.
@@ -571,6 +1505,7 @@
       if (r.ok && r.data && r.data.ok) {
         show(true, r.data.wqb_username || '');
         startPolling();
+        checkPersonaStatus();
       } else {
         show(false);
       }

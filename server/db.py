@@ -35,7 +35,9 @@ from . import operator_catalog as _operator_catalog
 from . import settings_fp as _settings_fp
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.abspath(os.path.join(_THIS_DIR, '..', 'data', 'hyfe_iqc.db'))
+DB_PATH = os.environ.get('HYFE_DB_PATH') or os.path.abspath(
+    os.path.join(_THIS_DIR, '..', 'data', 'hyfe_iqc.db')
+)
 SECRET_KEY_PATH = os.path.abspath(os.path.join(_THIS_DIR, '..', 'data', '.fernet.key'))
 
 _DB_LOCK = threading.Lock()
@@ -45,12 +47,18 @@ _INITIALIZED = False
 # 스키마/데이터 마이그레이션 버전. ALTER·백필을 프로세스마다 재실행하지 않도록
 # PRAGMA user_version 게이트의 기준값. 향후 스키마/데이터 마이그레이션을
 # 추가하면 반드시 이 값을 올려야 새 마이그레이션이 1회 적용된다.
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 9   # v9: users.submit_mode ('auto' 자동제출 | 'list' 대기목록만)
 _FERNET: Fernet | None = None
 
 FEEDBACK_CAP = 30
 SESSION_TTL_SEC = 7 * 24 * 3600  # 7일
 SPACE_RX = re.compile(r'\s+')
+
+
+def _column_missing(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    """테이블에 col 컬럼이 없으면 True (마이그레이션 가드용)."""
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+    return col not in cols
 
 
 def _coerce_float_or_none(v):
@@ -133,16 +141,38 @@ def genuine_selfcorr_reject(submit_status: str) -> bool:
     return _SELFCORR_NUM_RE.search(body) is not None
 
 
-def effectively_submitted(submitted: Any, submit_status: str) -> bool:
-    """이 알파를 제출 성공으로 간주할지 — 위 정책의 구현.
+# 제출이 **일어나지 않았음**이 확실한 상태 접두사. API 백엔드는 성공 시 정확히
+# 'submitted' 를 돌려주므로(wqb_api.submit_alpha), 이들은 전부 미제출이다.
+_NOT_SUBMITTED_PREFIXES = (
+    'submit_skipped:',        # 우리 게이트가 막음 (일일 예산·품질 문턱)
+    'submit_error:',          # 네트워크/인증 실패
+    'submit_pending_timeout:',
+    'rejected:',              # WQB 가 거절 (체크 미달)
+    'submit_http_',           # 403/401/502 — 응답 자체가 실패
+    'skip_star:',             # all-pass 아니라 시도조차 안 함
+    'fail:',
+)
+# 위 접두사의 SQL 판정식 (마이그레이션에서 재사용).
+_NOT_SUBMITTED_SQL = ' OR '.join(
+    f"TRIM(submit_status) LIKE '{p}%'" for p in _NOT_SUBMITTED_PREFIXES)
 
-    submit_status 가 비어 있으면(= Submit 시도 자체가 없었음, 예: sim 에러/
-    7개 미통과) submitted 플래그를 그대로 따른다. 시도가 있었으면
-    '구체 수치 동반 self-corr 거절' 일 때만 미제출, 그 외 전부 제출.
+
+def effectively_submitted(submitted: Any, submit_status: str) -> bool:
+    """이 알파를 제출 성공으로 간주할지.
+
+    ⚠ 2026-07-21 수정. 원래는 '상태값이 비어있지 않고 self-corr 거절이 아니면 제출'
+      이라는 **브라우저 시대 추정**이었다. 그땐 제출 성공 여부를 확실히 알 방법이 없어
+      낙관적으로 셌지만, REST API 백엔드는 성공을 정확히 'submitted' 로 알려준다.
+      그 추정을 그대로 두면 오늘 신설한 `submit_skipped:below_value(...)` 처럼
+      **제출한 적 없는 알파가 제출됨으로 기록된다** (라이브에서 8건 오기록 확인).
+      하루 4건뿐인 제출을 세는 화면이 거짓말을 하면 판단이 통째로 어긋난다.
     """
     s = (submit_status or '').strip()
     if not s:
+        # 시도 자체가 없었음(sim 에러 등) — 플래그를 그대로 따른다.
         return bool(submitted)
+    if s.startswith(_NOT_SUBMITTED_PREFIXES):
+        return False
     return not genuine_selfcorr_reject(s)
 
 
@@ -288,6 +318,178 @@ def init() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_bandit_user_dim ON bandit_arms(user_id, dimension);
+
+            -- ── v8.1: 제출 대기 큐 (2026-07-27 사장 지시) ──────────────────────
+            -- kind='theme': PURE_POWER_POOL_THEME 거절작 보관 — 테마는 주간 로테이션이라
+            --   다음 주 수동 재시도 가치가 있다(UI '제출 대기' 카드에서 버튼으로 1건씩).
+            -- kind='budget': 일일 제출 예산 초과분 — 다음 날 워커가 자동 드레인.
+            CREATE TABLE IF NOT EXISTS submit_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                alpha_pk INTEGER,
+                wqb_alpha_id TEXT NOT NULL,
+                code TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'theme',
+                status TEXT NOT NULL DEFAULT 'pending',
+                note TEXT NOT NULL DEFAULT '',
+                metrics TEXT NOT NULL DEFAULT '{}',
+                ts REAL NOT NULL,
+                updated_at REAL NOT NULL DEFAULT 0,
+                UNIQUE(user_id, wqb_alpha_id, kind),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            -- ── v8: 슈퍼알파 리서치 런 (⑤, AAF SuperAlpha 이식) ────────────────
+            -- OS 알파 풀 위의 selection×combo 그리드 시뮬 기록. 자동 제출 없음 —
+            -- 결과를 쌓아두고 제출 판단은 사람이 한다.
+            CREATE TABLE IF NOT EXISTS superalpha_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                ts REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',  -- running|done|error
+                seed_plus INTEGER NOT NULL DEFAULT 0,
+                selection TEXT NOT NULL DEFAULT '',
+                results TEXT NOT NULL DEFAULT '[]',
+                error TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            -- ── v7: 리서치 → 가설 → 전략스펙 (LLM 파이프라인) ──────────────────
+            -- 사용자가 요청을 넣으면 research_runs 1건이 생기고, Arachne 근거 수집 →
+            -- LLM 가설 N개(hypotheses) → 가설마다 타입드 유전체 후보 K개(strategy_specs).
+            -- 스펙은 GA 의 '초기 개체'로 소비된다(1회성). 요청이 없으면 이 테이블들은
+            -- 비어 있고 워커는 기존 무작위 GA 로 그대로 돈다.
+            CREATE TABLE IF NOT EXISTS research_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                    -- pending|gathering|ideating|concretizing|ready|error
+                evidence TEXT NOT NULL DEFAULT '',   -- [출처N] 번호매김 근거 블록
+                sources TEXT NOT NULL DEFAULT '[]',  -- [{"n":1,"title":..,"url":..}]
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_research_user ON research_runs(user_id, id);
+
+            CREATE TABLE IF NOT EXISTS hypotheses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                rationale TEXT NOT NULL DEFAULT '',
+                citations TEXT NOT NULL DEFAULT '[]',   -- 인용한 출처 번호 [1,4]
+                family_hint TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES research_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_hypo_run ON hypotheses(run_id);
+
+            CREATE TABLE IF NOT EXISTS strategy_specs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hypothesis_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                genome TEXT NOT NULL,                  -- 검증된 타입드 유전체 JSON
+                code TEXT NOT NULL,                    -- render(genome) 스냅샷
+                settings TEXT NOT NULL DEFAULT '{}',
+                delay INTEGER,                         -- 스펙이 원하는 delay (0/1) or NULL
+                status TEXT NOT NULL DEFAULT 'pending',
+                    -- pending|seeded|exhausted|rejected
+                seeded_round INTEGER,
+                alpha_id INTEGER,                      -- 이 스펙이 낳은 알파 행
+                why TEXT NOT NULL DEFAULT '',          -- 이 후보를 만든 이유(LLM)
+                created_at REAL NOT NULL,
+                FOREIGN KEY(hypothesis_id) REFERENCES hypotheses(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_specs_user_status
+                ON strategy_specs(user_id, status, id);
+
+            -- ── GenomicWQB 2.0: canonical identity + replayable evidence ──────
+            CREATE TABLE IF NOT EXISTS canonical_alphas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                canonical_key TEXT NOT NULL,
+                code TEXT NOT NULL,
+                code_hash TEXT NOT NULL,
+                settings_fp TEXT NOT NULL,
+                lineage_key TEXT NOT NULL DEFAULT '',
+                dataset_key TEXT NOT NULL DEFAULT '',
+                expression_key TEXT NOT NULL DEFAULT '',
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                times_seen INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(user_id, canonical_key),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_canonical_user_lineage
+                ON canonical_alphas(user_id, lineage_key, last_seen);
+
+            CREATE TABLE IF NOT EXISTS alpha_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                round_id INTEGER NOT NULL,
+                round_num INTEGER NOT NULL,
+                idx INTEGER NOT NULL,
+                canonical_id INTEGER,
+                alpha_id INTEGER,
+                spec_id INTEGER,
+                parent_alpha_id INTEGER,
+                search_mode TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                genes_changed TEXT NOT NULL DEFAULT '[]',
+                policy_version TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(user_id, round_id, idx),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(canonical_id) REFERENCES canonical_alphas(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_experiments_user_state
+                ON alpha_experiments(user_id, state, updated_at);
+
+            CREATE TABLE IF NOT EXISTS wqb_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                alpha_id INTEGER,
+                wqb_alpha_id TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                observed_at REAL NOT NULL,
+                policy_version TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshots_wid_kind
+                ON wqb_snapshots(user_id, wqb_alpha_id, kind, observed_at);
+
+            CREATE TABLE IF NOT EXISTS evidence_cards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                experiment_id INTEGER,
+                alpha_id INTEGER,
+                conclusion TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                UNIQUE(user_id, experiment_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS policy_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                version TEXT NOT NULL,
+                config TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                UNIQUE(user_id, version),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             ''')
 
             # ── 스키마/데이터 마이그레이션 (PRAGMA user_version 게이트) ──
@@ -362,23 +564,50 @@ def init() -> None:
                     'ON alphas(user_id, submitted)'
                 )
                 # Phase 1: 지표 컬럼(reward/통계 쿼리용) + 진화 lineage. 전부 nullable.
+                # genome = 생성 시점의 유전체 JSON. 이게 없으면 시딩이 코드에서 정규식으로
+                # 유전체를 역추출해야 하는데, 그건 손실 압축이라 자식이 부모를 복제조차 못 한다
+                # (2026-07-11 진단). genome IS NULL = 유전체 미보유 = 시드 자격 없음.
                 for _c, _decl in (
                     ('sharpe', 'REAL'), ('fitness', 'REAL'), ('turnover', 'REAL'),
                     ('drawdown', 'REAL'), ('margin', 'REAL'), ('returns', 'REAL'),
                     ('generation', 'INTEGER'), ('parent_alpha_id', 'INTEGER'),
+                    ('genome', 'TEXT'),
                 ):
                     if _c not in alpha_cols:
                         conn.execute(f'ALTER TABLE alphas ADD COLUMN {_c} {_decl}')
+
+                # v6: 변이 귀속(attribution) — 어떤 부모에 어떤 변이 축을 적용해 이
+                # 자식이 나왔는지. directive_stats() 가 (fail category × directive)
+                # 성공률 행렬로 집계해 정향변이의 Thompson sampling 에 먹인다.
+                for _c, _decl in (
+                    ('origin', 'TEXT'),          # random | mutate | crossover
+                    ('directive', 'TEXT'),        # smooth/sharpen/... (mutate 일 때만)
+                    ('genes_changed', 'TEXT'),    # 부모 대비 바뀐 유전자명 JSON 리스트
+                ):
+                    if _c not in alpha_cols:
+                        conn.execute(f'ALTER TABLE alphas ADD COLUMN {_c} {_decl}')
+                conn.execute(
+                    'CREATE INDEX IF NOT EXISTS idx_alphas_parent '
+                    'ON alphas(user_id, parent_alpha_id)'
+                )
+
+                # v7: 이 알파를 낳은 전략스펙(LLM 파이프라인 산출물). NULL = 순수 GA 산.
+                if 'spec_id' not in alpha_cols:
+                    conn.execute('ALTER TABLE alphas ADD COLUMN spec_id INTEGER')
 
                 # 데이터 마이그레이션 (idempotent) — Submit 클릭이 발생했으나
                 # '구체 수치 동반 self-corr 거절' 이 아닌 모든 알파를 제출 성공으로 정정.
                 # 과거에 fail:no_response_modal_less / rejected:Cannot submit 로
                 # 잘못 미제출 처리된 행들을 한 번에 바로잡는다. 진짜 self-corr
                 # 거절(수치 포함)만 submitted=0 으로 남는다. 이미 1 인 행은 무변화.
+                # ⚠ 2026-07-21: 미제출이 확실한 상태값은 제외한다. 이 조건이 없으면
+                #   기동할 때마다 submit_skipped:/rejected: 행을 제출 성공으로 되돌려
+                #   effectively_submitted 수정이 무효화된다.
                 conn.execute(
                     'UPDATE alphas SET submitted=1 '
                     "WHERE submitted=0 AND TRIM(submit_status) <> '' "
-                    f'AND NOT ({_GENUINE_SELFCORR_SQL})'
+                    f'AND NOT ({_GENUINE_SELFCORR_SQL}) '
+                    f'AND NOT ({_NOT_SUBMITTED_SQL})'
                 )
 
                 # rounds 테이블 마이그레이션 — focused sub-round 메타.
@@ -411,6 +640,41 @@ def init() -> None:
                     conn.execute(
                         "ALTER TABLE users ADD COLUMN focus_queue TEXT NOT NULL DEFAULT '[]'"
                     )
+
+                # v4: 계정 유형 (standard=브라우저, research_consultant=공식 API)
+                if _column_missing(conn, 'users', 'account_type'):
+                    conn.execute(
+                        "ALTER TABLE users ADD COLUMN account_type TEXT NOT NULL DEFAULT 'standard'"
+                    )
+
+                # v7: 시뮬 백엔드 = **측정된 능력**('api'), 역할(account_type)과 분리한다.
+                # ''(미탐침) → 첫 로그인/워커 기동 때 POST /authentication 으로 1회 탐침.
+                # RC 는 오늘 이미 API 로 도는 게 증명돼 있으므로 그대로 백필한다.
+                # ⚠ 반드시 account_type ALTER **뒤에** 와야 한다 — 신규 DB 는 이 시점에야
+                #   account_type 컬럼이 존재한다(아래 UPDATE 가 그걸 참조한다).
+                if _column_missing(conn, 'users', 'backend'):
+                    conn.execute(
+                        "ALTER TABLE users ADD COLUMN backend TEXT NOT NULL DEFAULT ''")
+                    conn.execute(
+                        "UPDATE users SET backend='api' "
+                        "WHERE account_type='research_consultant'")
+
+                # v8 (2026-07-26): Yield Score — arm 별 '게이트 통과(best)' 카운트.
+                # 시뮬 1건당 통과 확률(yield = pass_sum/visits)이 arm 배분에 섞인다
+                # (ACE 대회 Yield Score 정신 — 무의미 시뮬로 넓힌 arm 을 감점).
+                if _column_missing(conn, 'bandit_arms', 'pass_sum'):
+                    conn.execute(
+                        'ALTER TABLE bandit_arms ADD COLUMN pass_sum '
+                        'INTEGER NOT NULL DEFAULT 0')
+
+                # v9 (2026-07-27): 제출 모드 — 'auto'(자동 제출) | 'list'(대기 목록만).
+                # 사용자별로 둔다. 멀티유저로 올리면 남의 계정이 내 뜻과 다르게 실주문
+                # (제출은 되돌릴 수 없고 일일 예산을 쓴다)을 내면 안 된다.
+                # 기존 사용자는 지금 동작(자동 제출)을 유지해야 하므로 DEFAULT 'auto'.
+                if _column_missing(conn, 'users', 'submit_mode'):
+                    conn.execute("ALTER TABLE users ADD COLUMN submit_mode TEXT "
+                                 "NOT NULL DEFAULT 'auto'")
+
                 conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         _INITIALIZED = True
 
@@ -471,6 +735,202 @@ def record_submit_attempt(conn, user_id: int, round_num: int, idx: int, code: st
     )
 
 
+#: 거절 이력을 '아직 유효한 판정'으로 볼 기간. **영구가 아니다** — Power Pool·테마
+#: 조건이 바뀌면 같은 알파가 통과할 수 있으므로(2026-07-28 사장 지적) 하루면 만료된다.
+#: 테마 경계가 UTC 자정(=KST 09:00)이라 하루가 자연스러운 단위이고, 이 코드베이스의
+#: 다른 보류 벽(fieldset_cooldown·family_corr_wall)도 같은 24h 를 쓴다.
+REJECT_MEMORY_S = float(os.environ.get('IQC_REJECT_MEMORY_S', str(24 * 3600)))
+
+
+def code_submitted_before(user_id: int, code: str) -> bool:
+    """같은 식이 이미 제출 성공(OS)됐는가 — 동일 코드 재제출은 영구 무의미.
+
+    family_dup_today 벽 제거(2026-08-03) 후의 최소 가드: GA 후보 생성이 결정론이라
+    이미 OS 에 오른 이기는 식이 그대로 재생산·재시뮬되는데(8/3 새벽 5건 실측),
+    그걸 다시 내면 WQB 만 두드리는 무의미 왕복이다. 형제(다른 식)는 막지 않는다."""
+    if not code:
+        return False
+    init()
+    with _DB_LOCK, _connect() as conn:
+        return conn.execute(
+            'SELECT 1 FROM alphas WHERE user_id=? AND code=? AND submitted=1 LIMIT 1',
+            (user_id, code)).fetchone() is not None
+
+
+def unsubmitted_check_candidates(user_id: int, limit: int = 12) -> list[tuple]:
+    """무료 체크로 오늘 판정을 받아볼 만한 미제출 알파 — (wqb_id, sharpe, fitness, pk, code).
+
+    fitness 내림차순. 제출 관문에서 fitness 가 가장 자주 병목이라(2026-08-05) 그쪽부터 본다.
+    pk·code 를 같이 주는 이유는 여기서 제출이 성사됐을 때 알파 행을 되짚어 기록하기
+    위해서다 — 없던 동안 무료체크 발 제출은 카운트에도 제출 내역에도 안 남았다(2026-08-07).
+    """
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, code, metrics, sharpe, fitness FROM alphas WHERE user_id=? AND submitted=0 "
+            "AND TRIM(error_text)='' AND fitness IS NOT NULL AND sharpe IS NOT NULL "
+            "AND metrics LIKE '%wqb_alpha_id%' ORDER BY fitness DESC, sharpe DESC LIMIT ?",
+            (user_id, int(limit) * 3)).fetchall()
+    out, seen = [], set()
+    for r in rows:
+        try:
+            wid = str((json.loads(r['metrics'] or '{}')).get('wqb_alpha_id') or '')
+        except (TypeError, ValueError):
+            continue
+        if not wid or wid in seen:
+            continue
+        seen.add(wid)
+        out.append((wid, r['sharpe'], r['fitness'], int(r['id']), r['code'] or ''))
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def dataset_concentration(user_id: int, since_ts: float) -> list[tuple]:
+    """제출작의 데이터셋 집중도 — (데이터셋접두어, 건수) 내림차순.
+
+    Power Pool 점수는 개수가 아니라 풀에 더한 순증분이다. 2026-08-04 실측: 제출 21건 중
+    11건이 rsk70_mfm2_gemtrd 한 데이터셋이었다 — 11개를 내도 1개어치로 계산된다.
+    """
+    import re as _re
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT code FROM alphas WHERE user_id=? AND submitted=1 AND ts>?",
+            (user_id, float(since_ts))).fetchall()
+    tally: dict[str, int] = {}
+    for r in rows:
+        seen = set()
+        for f in _re.findall(r'\b([a-z][a-z0-9]{2,})_[a-z0-9_]{3,}', str(r['code'] or '')):
+            if f in ('winsorize', 'group', 'ts', 'vec'):
+                continue
+            seen.add(f)
+        for pre in seen:
+            tally[pre] = tally.get(pre, 0) + 1
+    return sorted(tally.items(), key=lambda kv: -kv[1])
+
+
+def rejection_and_success_checks(user_id: int, since_ts: float) -> list[tuple]:
+    """게이트 실측용 원자료 — (ts, submitted, submit_status, fail_items) 목록.
+
+    gate_watch 가 '무엇이 실제로 제출을 막는가'를 여기서 복원한다. 거절 사유에 이름이
+    나온 체크는 하드, 제출 성공작의 fail_items 에 있던 체크는 소프트다.
+    """
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT ts, submitted, submit_status, fail_items FROM alphas "
+            "WHERE user_id=? AND ts>? AND (submitted=1 OR submit_status LIKE 'rejected:%')",
+            (user_id, float(since_ts))).fetchall()
+    out = []
+    for r in rows:
+        try:
+            fi = json.loads(r['fail_items'] or '[]')
+        except (TypeError, ValueError):
+            fi = []
+        out.append((r['ts'], int(r['submitted'] or 0), r['submit_status'], fi))
+    return out
+
+
+def code_settings_rejected_before(user_id: int, code: str, settings_fp: str,
+                                  since_s: float | None = None) -> str | None:
+    """같은 식 **× 같은 설정**이 최근 거절당했으면 그 사유. 없으면 None.
+
+    ⚠ 코드만 보면 안 된다 — 중립화가 다르면 아예 다른 실험이다(2026-08-04 실측:
+    같은 식이 SLOW_AND_FAST 에서 S=2.91, CROWDING 에서 S=0.81). decay 는 거의
+    안 바뀌고(±0.05) truncation 은 그대로지만, 그 둘도 settings_fp 안에 있으므로
+    지문이 다르면 통과시킨다 — 재시뮬 몇 건이 죽은 실험 하나보다 싸다.
+    `alphas` 를 읽는다(submit_attempts 엔 설정 컬럼이 없다).
+    """
+    if not code or not settings_fp:
+        return None
+    init()
+    window = REJECT_MEMORY_S if since_s is None else float(since_s)
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT submit_status FROM alphas WHERE user_id=? AND code_hash=? "
+            "AND settings_fp=? AND submit_status LIKE 'rejected:%' AND ts>? "
+            'ORDER BY ts DESC LIMIT 1',
+            (user_id, code_hash(code), settings_fp, time.time() - window)).fetchone()
+    return str(row['submit_status']) if row else None
+
+
+def code_rejected_before(user_id: int, code: str,
+                         since_s: float | None = None) -> str | None:
+    """같은 식이 **최근에** WQB 에 거절당했으면 그 사유. 없으면 None.
+
+    ⚠ 2026-07-28 실측 루프. 후보 생성이 결정론이라 재시작/재방문 때 **같은 식이 다시
+    만들어지고**, 시뮬 결과는 캐시에서 나오므로 같은 알파를 또 제출한다 — 알파
+    1YzG86aM 이 16:06 과 16:20 에 똑같은 5개 FAIL 로 두 번 거절됐다. 같은 식이면
+    판정도 같으니 두 번째부터는 보낼 이유가 없다(stuck_submits 는 이미 이 규칙을
+    code_hash 로 쓰고 있었는데, 본 제출 경로만 빠져 있었다).
+    """
+    if not code:
+        return None
+    init()
+    window = REJECT_MEMORY_S if since_s is None else float(since_s)
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT submit_status FROM submit_attempts WHERE user_id=? AND code=? "
+            "AND submitted=0 AND submit_status LIKE 'rejected:%' AND ts>? "
+            'ORDER BY ts DESC LIMIT 1',
+            (user_id, code, time.time() - window)).fetchone()
+    return str(row['submit_status']) if row else None
+
+
+def day_start_ts(now: float | None = None) -> float:
+    """일일 제출 예산의 리셋 경계 = **미국 동부시간 자정** (여름 KST 13:00 / 겨울 14:00).
+
+    2026-07-27 API 실측으로 확정: `/users/self/activities/submissions` 가
+    UTC 7/27 01:33(= EDT 7/26 21:33)에 'yesterday=2026-07-25' 를 반환했다.
+    즉 플랫폼의 '오늘'은 EDT 7/26 — 날짜 버킷이 **UTC 도 UTC-5 고정도 아니고
+    DST 를 따르는 America/New_York** 이다. (구 코드는 UTC-5 고정이라 여름에
+    1시간 늦게 리셋됐다.)
+
+    tzdata 가 없는 환경에서는 UTC-4 로 폴백한다(여름 기준, 최대 1시간 오차).
+    """
+    import datetime as _dt
+    ts = time.time() if now is None else float(now)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('America/New_York')
+    except Exception:
+        tz = _dt.timezone(_dt.timedelta(hours=-4))
+    local = _dt.datetime.fromtimestamp(ts, tz)
+    return local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def platform_date(now: float | None = None) -> str:
+    """WQB 가 쓰는 '오늘' 날짜 문자열(YYYY-MM-DD, America/New_York).
+
+    `/users/self/activities/submissions` 의 records 가 이 날짜로 오므로, 제출 수를
+    대조하려면 같은 눈금이어야 한다. 경계 정의는 day_start_ts 와 동일하다.
+    """
+    import datetime as _dt
+    ts = time.time() if now is None else float(now)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('America/New_York')
+    except Exception:
+        tz = _dt.timezone(_dt.timedelta(hours=-4))
+    return _dt.datetime.fromtimestamp(ts, tz).strftime('%Y-%m-%d')
+
+
+def submitted_today(user_id: int, now: float | None = None) -> int:
+    """오늘(미국 동부시간 자정 기준 — day_start_ts) **성공한** 제출 건수.
+
+    WQB 컨설턴트는 하루 최대 4개까지만 제출할 수 있다(Power Pool 문서: "Max 4 alpha
+    submissions in a day").
+    """
+    start = day_start_ts(now)
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            'SELECT COUNT(*) AS n FROM submit_attempts '
+            'WHERE user_id=? AND submitted=1 AND ts>=?', (user_id, start)).fetchone()
+    return int(row['n'] or 0) if row else 0
+
+
 def latest_submit_id(user_id: int) -> int:
     init()
     with _DB_LOCK, _connect() as conn:
@@ -502,15 +962,26 @@ def set_last_cleared_submit_id(user_id: int, submit_id: int) -> int:
     return int(row['last_cleared_submit_id'] or 0) if row else 0
 
 
-def list_submit_attempts(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
-    """최근 제출 시도 — 비우기 지점 이후만, 최신순. 모바일 대시보드용."""
+def list_submit_attempts(user_id: int, limit: int = 50,
+                         scope: str = 'submitted') -> list[dict[str, Any]]:
+    """최근 제출 시도 — 비우기 지점 이후만, 최신순.
+
+    scope='submitted'(기본) — **성공한 제출만**. 화면의 '제출 내역' 은 "무엇이 나갔나"
+      를 보는 곳이지 실패 로그가 아니다 (2026-07-27 사장 지시).
+    scope='all' — 스킵·거절 포함(감사용).
+
+    ⚠ 걸러내기는 반드시 **서버에서** 해야 한다. 예전엔 전부 실어 보내고 화면이 걸렀는데,
+    그러면 limit 이 '보이는 행' 이 아니라 '전체 행' 에 걸린다 — 실제로 시도 54건 중
+    50건(대부분 게이트 스킵)만 오면서 **성공 제출 1건이 화면에서 사라졌다**.
+    """
     init()
     cleared = get_last_cleared_submit_id(user_id)
+    _f = ' AND submitted=1' if scope != 'all' else ''
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
             'SELECT id, round_num, idx, code, submitted, submit_status, '
-            'pass_count, fail_count, ts FROM submit_attempts '
-            'WHERE user_id=? AND id>? ORDER BY id DESC LIMIT ?',
+            f'pass_count, fail_count, ts FROM submit_attempts '
+            f'WHERE user_id=? AND id>?{_f} ORDER BY id DESC LIMIT ?',
             (user_id, cleared, int(limit)),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -543,7 +1014,7 @@ def encrypt(text: str) -> str:
     return _FERNET.encrypt(text.encode('utf-8')).decode('ascii')
 
 
-_DECRYPT_LOG = logging.getLogger('hyfe.db.decrypt')
+_DECRYPT_LOG = logging.getLogger('genomicwqb.db.decrypt')
 
 
 def decrypt(token: str) -> str:
@@ -578,7 +1049,8 @@ def code_hash(code: str) -> str:
 # users
 # ─────────────────────────────────────────────────────────────────────────────
 
-def upsert_user(wqb_username: str, wqb_password: str, gemini_api_key: str) -> int:
+def upsert_user(wqb_username: str, wqb_password: str, gemini_api_key: str,
+                account_type: str = 'standard') -> int:
     """로그인 검증 통과 시 호출. 기존 user 면 자격증명 업데이트, 없으면 신규.
 
     반환: user_id.
@@ -594,16 +1066,57 @@ def upsert_user(wqb_username: str, wqb_password: str, gemini_api_key: str) -> in
             uid = int(row['id'])
             conn.execute(
                 'UPDATE users SET wqb_password_enc=?, gemini_api_key_enc=?, '
-                'last_login_at=?, last_validated_at=? WHERE id=?',
-                (pw_enc, key_enc, now, now, uid),
+                'last_login_at=?, last_validated_at=?, account_type=? WHERE id=?',
+                (pw_enc, key_enc, now, now, account_type, uid),
             )
             return uid
+        # RC 는 정의상 API 능력이 증명된 역할이므로 backend 를 미리 'api' 로 둔다
+        # (마이그레이션 백필과 일관 — 워커가 굳이 재탐침하지 않는다). standard 는
+        # ''(미탐침)으로 두고 로그인/워커 첫 기동의 능력 탐침이 채운다.
+        _backend = 'api' if account_type == 'research_consultant' else ''
         cur = conn.execute(
             'INSERT INTO users (wqb_username, wqb_password_enc, gemini_api_key_enc, '
-            'created_at, last_login_at, last_validated_at) VALUES (?,?,?,?,?,?)',
-            (wqb_username, pw_enc, key_enc, now, now, now),
+            'account_type, backend, created_at, last_login_at, last_validated_at) '
+            'VALUES (?,?,?,?,?,?,?,?)',
+            (wqb_username, pw_enc, key_enc, account_type, _backend, now, now, now),
         )
         return int(cur.lastrowid)
+
+
+@_with_conn
+def get_user_id_by_username(conn, wqb_username: str) -> 'int | None':
+    row = conn.execute('SELECT id FROM users WHERE wqb_username=?', (wqb_username,)).fetchone()
+    return row['id'] if row else None
+
+
+@_with_conn
+def get_account_type(conn, user_id: int) -> str:
+    row = conn.execute('SELECT account_type FROM users WHERE id=?', (user_id,)).fetchone()
+    return (row['account_type'] if row and row['account_type'] else 'standard')
+
+
+@_with_conn
+def set_account_type(conn, user_id: int, account_type: str) -> None:
+    conn.execute('UPDATE users SET account_type=? WHERE id=?', (account_type, user_id))
+
+
+SUBMIT_MODES = ('auto', 'list')
+
+
+@_with_conn
+def get_submit_mode(conn, user_id: int) -> str:
+    """'auto' = 게이트 통과 알파를 즉시 제출 · 'list' = 제출하지 않고 대기 목록에만."""
+    row = conn.execute('SELECT submit_mode FROM users WHERE id=?', (user_id,)).fetchone()
+    mode = row['submit_mode'] if row else None
+    return mode if mode in SUBMIT_MODES else 'auto'
+
+
+@_with_conn
+def set_submit_mode(conn, user_id: int, mode: str) -> str:
+    """알 수 없는 값은 'auto' 로 떨어뜨린다 — 조용히 제출을 멈추는 쪽이 더 나쁘다."""
+    mode = mode if mode in SUBMIT_MODES else 'auto'
+    conn.execute('UPDATE users SET submit_mode=? WHERE id=?', (mode, user_id))
+    return mode
 
 
 def get_user(user_id: int) -> dict[str, Any] | None:
@@ -675,6 +1188,17 @@ def list_running_user_ids() -> list[int]:
     return [int(r['id']) for r in rows]
 
 
+def list_users() -> list[dict[str, Any]]:
+    """전 사용자의 (id, account_type, backend, running, paused). 세션 keeper 가
+    쓴다 — 워커가 안 돌고 있어도 API 세션은 살려둬야 하니까."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, wqb_username, account_type, backend, running, paused FROM users'
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_user_credentials(user_id: int) -> tuple[str, str, str] | None:
     """(wqb_username, wqb_password, gemini_api_key) — 워커가 사용."""
     u = get_user(user_id)
@@ -705,13 +1229,17 @@ def get_user_status(user_id: int) -> dict[str, Any]:
         last_round_num = int(u['last_round_num'] or 0)
         # 진행 중 라운드 조회 — phase 포함.
         r = conn.execute(
-            'SELECT round_num, status, phase FROM rounds WHERE user_id=? AND ended_at IS NULL '
-            'ORDER BY id DESC LIMIT 1', (user_id,),
+            'SELECT round_num, status, phase, parent_idx FROM rounds '
+            'WHERE user_id=? AND ended_at IS NULL ORDER BY id DESC LIMIT 1',
+            (user_id,),
         ).fetchone()
     cur_round = int(r['round_num']) if r else None
     cur_phase = int(r['phase']) if r else 0
+    cur_parent_idx = int(r['parent_idx']) if r and r['parent_idx'] else 0
     if cur_round is None:
         cur_label = '—'
+    elif cur_phase > 0 and cur_parent_idx > 0:
+        cur_label = f'{cur_round}-{cur_parent_idx}-{cur_phase}'
     elif cur_phase > 0:
         cur_label = f'{cur_round}-{cur_phase}'
     else:
@@ -817,6 +1345,16 @@ def update_round_status(conn, round_id: int, status: str) -> None:
     conn.execute('UPDATE rounds SET status=? WHERE id=?', (status, round_id))
 
 
+@_with_conn
+def interrupt_open_rounds(conn, summary: str = '서버 재시작으로 미완료 라운드 정리') -> int:
+    now = time.time()
+    cur = conn.execute(
+        'UPDATE rounds SET status=?, ended_at=?, summary=? WHERE ended_at IS NULL',
+        ('interrupted', now, summary),
+    )
+    return cur.rowcount or 0
+
+
 def update_round_config(round_id: int, **fields) -> None:
     """Write bandit / generation config-snapshot columns to a rounds row.
 
@@ -855,7 +1393,9 @@ def finish_round(round_id: int, user_id: int, round_num: int, *,
                          (round_num, user_id, round_num))
 
 
-def insert_alpha(user_id: int, round_id: int, round_num: int, alpha: dict[str, Any]) -> None:
+def insert_alpha(user_id: int, round_id: int, round_num: int, alpha: dict[str, Any]) -> int:
+    """알파 1행 저장. 반환값 = 새 alphas.id — focus 큐가 parent_alpha_id 로 실어
+    보내 부모→자식 귀속 엣지를 잇는 데 쓴다."""
     init()
     code = alpha.get('code', '')
     # is_status 가 들어 있으면 그쪽 권위 — pass_count/fail_count/items + error/pending 갯수도 거기서 derive.
@@ -898,15 +1438,27 @@ def insert_alpha(user_id: int, round_id: int, round_num: int, alpha: dict[str, A
     # lineage
     _generation      = int(alpha.get('generation') or 0)
     _parent_alpha_id = alpha.get('parent_alpha_id')
+    # 유전체 원본 — 있으면 그대로 보존한다. 없으면(레거시/Gemini 경로) NULL.
+    _genome_obj = alpha.get('genome')
+    _genome = (json.dumps(dict(_genome_obj), ensure_ascii=False)
+               if isinstance(_genome_obj, dict) and _genome_obj else None)
+    # 변이 귀속 (v6) — 빈 값은 NULL 로 저장해 directive_stats 필터를 단순하게.
+    _origin = (str(alpha.get('origin') or '').strip() or None)
+    _directive = (str(alpha.get('directive') or '').strip() or None)
+    _gc = alpha.get('genes_changed')
+    _genes_changed = (json.dumps(list(_gc), ensure_ascii=False)
+                      if isinstance(_gc, (list, tuple)) else None)
+    _spec_id = alpha.get('spec_id')
 
     with _DB_LOCK, _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             'INSERT INTO alphas (user_id, round_id, round_num, idx, code, code_hash, desc, '
             'pass_count, pass_items, fail_count, fail_items, error_text, metrics, mode, '
             'cached, submitted, submit_status, error_count, pending_count, phase, ts, '
             'region, universe, delay, neutralization, decay, truncation, settings_fp, self_corr, '
-            'sharpe, fitness, turnover, drawdown, margin, returns, generation, parent_alpha_id) '
-            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            'sharpe, fitness, turnover, drawdown, margin, returns, generation, parent_alpha_id, '
+            'genome, origin, directive, genes_changed, spec_id) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (
                 user_id, round_id, round_num, int(alpha.get('idx') or 0),
                 code, code_hash(code), alpha.get('desc', ''),
@@ -935,9 +1487,12 @@ def insert_alpha(user_id: int, round_id: int, round_num: int, alpha: dict[str, A
                 fp,
                 _coerce_float_or_none(_sc),
                 _sharpe, _fitness, _turnover, _drawdown, _margin, _returns,
-                _generation, _parent_alpha_id,
+                _generation, _parent_alpha_id, _genome,
+                _origin, _directive, _genes_changed,
+                int(_spec_id) if _spec_id is not None else None,
             ),
         )
+        return int(cur.lastrowid)
 
 
 def lookup_alpha_by_hash(user_id: int, h: str,
@@ -991,6 +1546,32 @@ def list_recent_alphas(user_id: int, limit: int = 60) -> list[dict[str, Any]]:
     return [_alpha_view(r) for r in rows]
 
 
+def get_alpha_by_id(user_id: int, alpha_pk: int) -> dict[str, Any] | None:
+    """알파 1건 — **본인 것만**. 리더보드 상세 보기 / 수동 큐 추가용."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute('SELECT * FROM alphas WHERE id=? AND user_id=?',
+                           (int(alpha_pk), user_id)).fetchone()
+    return _alpha_view(row) if row else None
+
+
+def get_alpha_by_code(user_id: int, code: str) -> dict[str, Any] | None:
+    """알파 1건 — 코드로, **본인 것만**, 가장 최근 시뮬.
+
+    submit_attempts(제출 내역) 에는 alpha pk 가 없고 code 만 있다. 상세 화면을 열려면
+    그 코드로 alphas 를 되짚어야 한다. idx_alphas_user_hash 를 타도록 code_hash 로 본다.
+    """
+    if not code:
+        return None
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            'SELECT * FROM alphas WHERE user_id=? AND code_hash=? ORDER BY id DESC LIMIT 1',
+            (user_id, code_hash(code)),
+        ).fetchone()
+    return _alpha_view(row) if row else None
+
+
 def list_submitted_alphas(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
     """WQB Submit 클릭이 발생한 모든 알파 — 성공 / 거절 둘 다 포함, 최신순.
 
@@ -1035,38 +1616,407 @@ def list_rejected_alpha_codes(user_id: int, limit: int = 40) -> list[str]:
     return out
 
 
-def best_alphas_for_seeding(user_id: int, top_n: int = 5,
-                              min_pass_count: int = 5) -> list[dict[str, Any]]:
-    """smilee scoring 정신: PASS 많은 알파를 'building block' 으로 다음 라운드에 재사용.
+ELITE_WINDOW = int(os.environ.get('IQC_ELITE_WINDOW', '400'))
+"""엘리트를 고르는 최근성 윈도우(알파 개수). 과거 전체를 보면 풀이 '화석'에서 굳는다."""
 
-    pass_count >= min_pass_count 인 알파 중, sharpe 가 높은 순으로 top_n 개 반환.
-    metrics 안의 sharpe 가 비어있으면 pass_count 로 정렬 fallback.
+ELITE_MIN_SCORE = float(os.environ.get('IQC_ELITE_MIN_SCORE', '0.02'))
+"""시드가 되기 위한 selection_score 하한. 0 = 시뮬 실패/무지표 알파(부모 자격 없음)."""
+
+HALL_OF_FAME_N = int(os.environ.get('IQC_HALL_OF_FAME_N', '2'))
+"""최근성 윈도우 **밖**의 역대 최고 유전체에 예약하는 시드 슬롯 수. 0 = 끄기.
+
+왜 필요한가 (2026-07-14): ELITE_WINDOW=400 은 화석화를 막지만, 그 대가로 **역대 최고
+알파가 400개 뒤로 밀리는 순간 유전자 풀에서 영구 소멸**한다. 라이브에서 6월의 Sharpe
+3.77 / 3.43 알파(레짐 조건부 + hump + 서브인더스트리 중립화)가 정확히 그렇게 사라졌고,
+7/12 콜드스타트 이후 풀의 최고가 1.42 에 머물렀다. 윈도우는 유지하되, 역대 최고 K개를
+별도 슬롯으로 되돌려 그 유전자가 교차 재료로 계속 살아 있게 한다.
+소수 슬롯(기본 2/5)으로 제한해 화석이 풀을 점거하지는 못하게 한다.
+"""
+
+HALL_OF_FAME_POOL = int(os.environ.get('IQC_HALL_OF_FAME_POOL', '60'))
+"""명예의 전당 후보를 sharpe 상위 몇 행에서 고를지 (그중 selection_score 로 재정렬)."""
+
+
+def _hydrate_alpha_row(r) -> dict[str, Any] | None:
+    """alphas 행 → 시드 dict(metrics/genome 파싱 + _sharpe/_score 계산). 부적격이면 None."""
+    from . import reward as _reward
+    d = dict(r)
+    try:
+        d['metrics'] = json.loads(d.get('metrics') or '{}')
+    except Exception:
+        d['metrics'] = {}
+    try:
+        d['genome'] = json.loads(d.get('genome') or '{}')
+    except Exception:
+        return None
+    if not isinstance(d['genome'], dict) or not d['genome']:
+        return None
+    # 사다리 사망은 부모 자격이 없다 — IS_LADDER_SHARPE(최근 구간 수익 전무)는
+    # 변주로 안 고쳐진다(8/1 실측). 이 실격이 없으면 고샤프 ladder-dead 클러스터가
+    # sharpe 기반 selection_score 로 엘리트·명예의전당을 점령해 같은 가계 변주만
+    # 계속 나온다(8/2 오후 실측: 게이트 시도 106중 91이 ladder 실패, 제출 0).
+    # LOW_2Y_SHARPE 는 같은 검사의 단일데이터셋 이름(criteria.py: 다중=IS_LADDER,
+    # 단일=LOW_2Y)이라 함께 거른다 — 한쪽만 거르면 같은 가계가 이름만 바꿔 살아남는다.
+    _fi = str(d.get('fail_items') or '')
+    if 'LADDER' in _fi or 'LOW_2Y' in _fi:
+        return None
+    # 우리 PP 풀과 상관 0.5 초과로 거절된 계보도 실격 — 자식도 같은 풀과 겹쳐 PP 자격을
+    # 못 얻고 표준컷에 막힌다(2026-09-20~22 전멸의 원인, wqb_api._rejection_reason 참조).
+    if 'POWER_POOL_CORRELATION' in str(d.get('submit_status') or ''):
+        return None
+    # 유전체 JSON 이 lineage 의 권위. 컬럼은 폴백.
+    d['genome'].setdefault('generation', int(d.get('generation') or 0))
+    sh = d['metrics'].get('sharpe')
+    try:
+        d['_sharpe'] = float(str(sh).strip()) if sh not in (None, '') else 0.0
+    except (ValueError, TypeError):
+        d['_sharpe'] = 0.0
+    d['_score'] = _reward.selection_score(
+        d['metrics'],
+        pass_count=int(d.get('pass_count') or 0),
+        fail_count=int(d.get('fail_count') or 0),
+        error_count=int(d.get('error_count') or 0),
+        self_corr=d.get('self_corr'),
+    )
+    return d
+
+
+_SEED_COLS = ('id, code, code_hash, desc, pass_count, fail_count, error_count, '
+              'metrics, round_num, idx, universe, neutralization, decay, truncation, '
+              'self_corr, generation, genome, fail_items, submit_status')
+
+
+def _theme_order(records: list[dict[str, Any]], constraint) -> list[dict[str, Any]]:
+    """현재 required_checks 기준 안정 정렬. DB 행은 건드리지 않아 다음 주 재사용 가능."""
+    if constraint is None or not getattr(constraint, 'required_checks', ()):
+        return records
+    rank = {'pass': 2, 'unknown': 1, 'fail': 0}
+    try:
+        return sorted(
+            records,
+            key=lambda d: rank[constraint.required_check_state(
+                metrics=d.get('metrics') or {})],
+            reverse=True,
+        )
+    except Exception:
+        return records
+
+
+def hall_of_fame_seeds(user_id: int, top_n: int = 2, *,
+                       pool: int | None = None,
+                       constraint=None) -> list[dict[str, Any]]:
+    """역대(윈도우 무관) 최고 유전체 top_n 개. 유전체가 없는 행은 애초에 후보가 아니다.
+
+    sharpe 상위 `pool` 행을 먼저 뽑고(인덱스 친화적), 그 안에서 selection_score 로 재정렬한다.
+    sharpe 만으로 고르면 turnover/self-corr 가 망가진 알파가 올라온다.
+    """
+    if top_n <= 0:
+        return []
+    init()
+    _pool = int(pool if pool is not None else HALL_OF_FAME_POOL)
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            f'SELECT {_SEED_COLS} FROM alphas '
+            'WHERE user_id=? AND genome IS NOT NULL '
+            "AND TRIM(error_text) = '' AND sharpe IS NOT NULL "
+            'ORDER BY sharpe DESC LIMIT ?',
+            (user_id, _pool),
+        ).fetchall()
+    best_by_code: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        d = _hydrate_alpha_row(r)
+        if d is None:
+            continue
+        key = d.get('code_hash') or d.get('code') or ''
+        prev = best_by_code.get(key)
+        if prev is None or d['_score'] > prev['_score']:
+            best_by_code[key] = d
+    out = sorted(best_by_code.values(),
+                 key=lambda d: (d['_score'], d['id']), reverse=True)
+    out = _theme_order(out, constraint)
+    return out[:top_n]
+
+
+def elite_seeds(user_id: int, top_n: int = 5, *,
+                window: int | None = None,
+                min_score: float | None = None,
+                hall_of_fame: int | None = None,
+                constraint=None) -> list[dict[str, Any]]:
+    """다음 라운드의 교차/변이 재료가 될 엘리트 유전체 top_n 개.
+
+    구(舊) `best_alphas_for_seeding` 을 대체한다. 그 함수는 세 가지가 동시에 틀렸다
+    (2026-07-11 라이브 진단, uid2 round 66~250):
+
+    1. `WHERE pass_count >= 5` 하드 게이트. pass_count 는 최대 ~7 인 이산 카운터라
+       자식(최대 4)이 절대 통과하지 못한다 → 풀이 184 라운드째 동결.
+    2. 최근성 윈도우 없음 + `ORDER BY pass_count DESC, id DESC` → 언제나 **같은 5행**.
+    3. 유전체를 코드에서 정규식으로 역추출 → 부모를 복제조차 못 하는 자식 생산.
+
+    새 규칙: **유전체를 실제로 보유한**(genome IS NOT NULL) 최근 `window` 개 알파를
+    후보로 삼고, 연속 적합도 `reward.selection_score` 상위 top_n 을 고른다. 동점이면
+    최신 행이 이긴다. 같은 코드는 최고점 1건만 남긴다(풀이 자기복제로 붕괴하는 것을 막는다).
+
+    각 dict 은 `genome`(dict, 정확한 `generation` 포함) 과 `_score` 를 갖는다.
+    """
+    init()
+    _window = int(window if window is not None else ELITE_WINDOW)
+    _floor = float(min_score if min_score is not None else ELITE_MIN_SCORE)
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            f'SELECT {_SEED_COLS} '
+            'FROM alphas WHERE user_id=? AND genome IS NOT NULL '
+            "AND TRIM(error_text) = '' "
+            'ORDER BY id DESC LIMIT ?',
+            (user_id, _window),
+        ).fetchall()
+
+    best_by_code: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        d = _hydrate_alpha_row(r)
+        if d is None or d['_score'] < _floor:
+            continue
+        # dedup 키 = code_hash (코드가 같으면 한 자리만). 유전체 '형태' 기준 추가 dedup 은
+        # 일부러 안 한다 — render() 는 유전체의 순함수라 형태가 같으면 코드도 같아서
+        # 여기서 이미 걸리고, 형태만 보고 합치면 유전체가 빈약한 행들이 통째로 한 개로
+        # 뭉개진다(2026-07-14 시도 → 시드 풀이 1개로 붕괴해 되돌림).
+        # 다양성은 아래 NSGA-II 선택층(crowding)이 담당한다.
+        key = d.get('code_hash') or d.get('code') or ''
+        prev = best_by_code.get(key)
+        if prev is None or d['_score'] > prev['_score']:
+            best_by_code[key] = d
+
+    # 동점이면 최신(id 큰) 쪽이 이긴다 — 적합도가 평평한 구간에서 풀이 옛 행에 눌러앉지
+    # 않게 하는 anti-fossil 타이브레이크. 암묵적 안정정렬에 기대지 않고 명시한다.
+    out = sorted(best_by_code.values(),
+                 key=lambda d: (d['_score'], d['id']), reverse=True)
+
+    # 선택층 — IQC_SELECTION_MODE 로 score↔percentile↔NSGA-II 전환(즉시 롤백 가능).
+    #   percentile 은 IQC_SELECTION_DIVERSITY_LAM>0 이면 코드 Jaccard fitness-sharing 적용.
+    #   실패/미지정은 위의 selection_score 내림차순으로 안전 폴백.
+    #
+    # 2026-07-14: 기본을 'ref' → 'nsga2' 로 전환한다. 단일 가중합(ref)은 다양성 압력이
+    # 없어 엘리트 풀이 '균형점 화석' 하나로 수렴한다. NSGA-II 는 (sharpe, fitness,
+    # -turnover, -self_corr, 2Y sharpe) 파레토 면을 유지하므로 '고 Sharpe·저 Fitness'
+    # 같은 극단 개체가 살아남아 교차 재료가 된다. 롤백: IQC_SELECTION_MODE=ref.
+    _mode = os.environ.get('IQC_SELECTION_MODE', 'nsga2')
+    if _mode in ('percentile', 'nsga2') and out:
+        try:
+            from . import selection
+            _lam = float(os.environ.get('IQC_SELECTION_DIVERSITY_LAM', '0') or 0)
+            _sim = None
+            if _lam > 0:
+                from . import alpha_similarity
+                _sim = alpha_similarity.similarity
+            _order = selection.order_seed_records(out, mode=_mode, lam=_lam, sim_fn=_sim)
+            if _order is not None:
+                out = [out[i] for i in _order]
+        except Exception as e:
+            logging.getLogger('genomicwqb.db').warning(
+                'selection mode=%s 실패, score 폴백: %s', _mode, e)
+
+    # 어떤 체크가 필수인지는 현재 spec 이 정한다. PASS→미측정→실패 순으로만 묶고,
+    # 각 묶음 안의 기존 NSGA/적합도 순서는 보존한다. 테마가 바뀌면 같은 DB 풀을 새
+    # spec 으로 즉시 다시 정렬하므로 과거 부모를 삭제하거나 영구 감점하지 않는다.
+    out = _theme_order(out, constraint)
+
+    # ── 명예의 전당 슬롯 ────────────────────────────────────────────────────────
+    # 최근성 윈도우 **밖**으로 밀려난 역대 최고 유전체를 소수 슬롯만큼 되돌린다.
+    # 없으면 6월의 Sharpe 3.77 같은 유전자가 풀에서 영구 소멸한다(HALL_OF_FAME_N 참조).
+    # ⚠ 이것은 의도적으로 `window` 계약을 넘어선다 — 그게 존재 이유다. 순수한 윈도우
+    #    의미론이 필요한 호출부(테스트 포함)는 hall_of_fame=0 을 넘겨 끌 수 있다.
+    # 윈도우 후보를 밀어내지 않도록 top_n 의 절반까지만 내준다.
+    _hof_n = HALL_OF_FAME_N if hall_of_fame is None else int(hall_of_fame)
+    hof_slots = min(_hof_n, max(0, top_n // 2))
+    if hof_slots > 0:
+        try:
+            seen_codes = {d.get('code_hash') or d.get('code') or ''
+                          for d in out[:top_n]}
+            hof = [d for d in hall_of_fame_seeds(
+                       user_id, top_n=hof_slots + 3, constraint=constraint)
+                   if (d.get('code_hash') or d.get('code') or '') not in seen_codes]
+            if hof:
+                keep = out[:max(0, top_n - hof_slots)]
+                out = keep + hof[:hof_slots]
+        except Exception as e:
+            logging.getLogger('genomicwqb.db').warning('hall-of-fame 시드 실패(무시): %s', e)
+    return _theme_order(out, constraint)[:top_n]
+
+
+def recent_metrics(user_id: int, *, limit: int = 400,
+                   with_submitted: bool = False) -> list[dict[str, Any]]:
+    """최근 알파의 metrics dict 목록 (오류 행 제외, 최신순).
+
+    테마 플레이북이 '이 테마에서 뭐가 통과했나' 를 실측으로 읽는 용도.
+    with_submitted=True 면 각 dict 에 '_submitted'(bool) 를 얹는다.
     """
     init()
     with _DB_LOCK, _connect() as conn:
         rows = conn.execute(
-            'SELECT code, desc, pass_count, metrics, round_num, idx '
-            'FROM alphas WHERE user_id=? AND pass_count >= ? '
-            'ORDER BY pass_count DESC, id DESC LIMIT ?',
-            (user_id, min_pass_count, top_n * 4),
+            "SELECT metrics, submitted FROM alphas WHERE user_id=? "
+            "AND TRIM(error_text)='' ORDER BY id DESC LIMIT ?",
+            (user_id, int(limit)),
         ).fetchall()
     out = []
+    for r in rows:
+        try:
+            m = json.loads(r['metrics'] or '{}')
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(m, dict):
+            continue
+        if with_submitted:
+            m = dict(m, _submitted=bool(r['submitted']))
+        out.append(m)
+    return out
+
+
+def combine_pool(user_id: int, *, window: int = 600, top: int = 40,
+                 min_sharpe: float = 1.0, region: str | None = None) -> list[dict[str, Any]]:
+    """재조합 레이어(combine_layer)용 검증 알파 풀.
+
+    최근 `window` 행 중 오류 없고 sharpe >= min_sharpe 인 행을 code_hash 당
+    최고 sharpe 1개만 남겨 sharpe 내림차순 `top` 개. elite_seeds 와 달리
+    **genome 유무를 안 본다** — 재조합은 코드 수준 연산이라 LLM 산(産)
+    genome-less 알파도 재료가 된다. metrics 는 파싱해서 dict 로 돌려준다.
+    """
+    init()
+    # region 을 주면 그 리전 알파만 재료로 쓴다 (2026-07-27) — 리전이 바뀌면 옛
+    # 알파의 필드가 새 리전에 존재하지 않아 재조합이 통째로 'unknown variable' 이 된다.
+    _rf = ' AND UPPER(COALESCE(region, \'\'))=? ' if region else ''
+    _args = ([user_id, float(min_sharpe)] + ([str(region).upper()] if region else [])
+             + [int(window)])
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, code, code_hash, metrics, sharpe, universe, '
+            'neutralization, decay, truncation, self_corr '
+            'FROM alphas WHERE user_id=? AND TRIM(error_text)=\'\' '
+            'AND sharpe IS NOT NULL AND sharpe >= ?' + _rf +
+            ' ORDER BY id DESC LIMIT ?',
+            tuple(_args),
+        ).fetchall()
+    best_by_code: dict[str, dict[str, Any]] = {}
     for r in rows:
         d = dict(r)
         try:
             d['metrics'] = json.loads(d.get('metrics') or '{}')
-        except Exception:
+        except (TypeError, ValueError):
             d['metrics'] = {}
-        # sharpe 추출 (string '1.23' 또는 숫자) → float.
-        sh = d['metrics'].get('sharpe')
+        key = d.get('code_hash') or d.get('code') or ''
+        prev = best_by_code.get(key)
+        if prev is None or float(d.get('sharpe') or 0) > float(prev.get('sharpe') or 0):
+            best_by_code[key] = d
+    out = sorted(best_by_code.values(),
+                 key=lambda d: float(d.get('sharpe') or 0), reverse=True)
+    return out[:int(top)]
+
+
+def hunt_ladder_pool(user_id: int, *, window: int = 60, top: int = 4,
+                     min_abs_sharpe: float = 0.8,
+                     region: str | None = None) -> list[dict[str, Any]]:
+    """🧭 사냥 사다리 대상 — |Sharpe| 는 충분한데 부호·회전율·Fitness 로만 막힌 알파.
+
+    2026-07-27 GLB 사냥 이식: 그날 제출권에 든 알파는 'S=-0.98 (부호 반대) →
+    반전 → 사후 감쇠' 처방에서 나왔다. 그런 후보를 **직전 라운드들에서** 찾아
+    다음 라운드에 즉시 처방한다. 상관·에러로 죽은 알파는 대상이 아니다(그건 다른 병).
+    """
+    init()
+    _rf = " AND UPPER(COALESCE(region, ''))=? " if region else ''
+    _args = ([user_id, float(min_abs_sharpe)]
+             + ([str(region).upper()] if region else []) + [int(window)])
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, code, code_hash, metrics, sharpe, fitness, turnover, '
+            'fail_items, universe, neutralization, decay, truncation '
+            "FROM alphas WHERE user_id=? AND TRIM(error_text)='' "
+            'AND sharpe IS NOT NULL AND ABS(sharpe) >= ?' + _rf +
+            ' ORDER BY id DESC LIMIT ?',
+            tuple(_args),
+        ).fetchall()
+    from . import criteria as _criteria
+    # 형제 처방 제외 기준 = **실제로 상관 거절을 맞은 필드셋만** (2026-07-27 사장 결정).
+    #   "제출된 필드셋 전부 제외"는 과했다 — 거절은 예산을 안 쓰므로 형제도 일단
+    #   시도해 볼 가치가 있고, 통과하면 제출 수가 는다. WQB 가 CORRELATION 으로
+    #   거절한 뒤에야 그 필드셋을 사다리에서 뺀다(헛발질 반복 방지).
+    try:
+        from . import alpha_ast as _ast
+        _done = set(rejected_fieldsets(user_id, min_count=1,
+                                       reason_contains='CORRELATION'))
+    except Exception:
+        _ast, _done = None, set()
+    best: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        d = dict(r)
         try:
-            d['_sharpe'] = float(str(sh).strip()) if sh not in (None, '') else 0.0
-        except (ValueError, TypeError):
-            d['_sharpe'] = 0.0
-        out.append(d)
-    # sharpe 우선 순으로 다시 정렬 + top_n.
-    out.sort(key=lambda d: (d['pass_count'], d['_sharpe']), reverse=True)
-    return out[:top_n]
+            d['metrics'] = json.loads(d.get('metrics') or '{}')
+            fails = json.loads(d.get('fail_items') or '[]')
+        except (TypeError, ValueError):
+            continue
+        names = [str((f.get('name') if isinstance(f, dict) else f) or '') for f in fails]
+        blocking = [n for n in names if n and _criteria.is_blocking(n)]
+        if not blocking:
+            continue                      # 이미 제출 가능 — 처방 불필요
+        if not set(n.upper() for n in blocking) <= {
+                'LOW_SHARPE', 'LOW_FITNESS', 'HIGH_TURNOVER', 'LOW_TURNOVER'}:
+            continue                      # 구조적 실패(상관·서브유니버스 등)는 대상 아님
+        if _ast is not None and _done:
+            try:
+                fs = frozenset(_ast.fields_used(d.get('code') or ''))
+            except Exception:
+                fs = frozenset()
+            if fs and fs in _done:
+                continue                  # 이 신호는 이미 제출됨 — 형제 양산 금지
+        d['blocking'] = blocking
+        key = d.get('code_hash') or d.get('code') or ''
+        prev = best.get(key)
+        if prev is None or abs(float(d.get('sharpe') or 0)) > abs(float(prev.get('sharpe') or 0)):
+            best[key] = d
+    out = sorted(best.values(), key=lambda d: abs(float(d.get('sharpe') or 0)),
+                 reverse=True)
+    return out[:int(top)]
+
+
+def ht_rescue_pool(user_id: int, *, window: int = 600, top: int = 30,
+                   min_sharpe: float = 1.58, max_fitness: float = 1.0,
+                   min_turnover: float = 0.40,
+                   region: str | None = None) -> list[dict[str, Any]]:
+    """🚑 HT 구제 레이어용 부모 풀 — '신호는 검증됐고 회전만 문제'인 알파들.
+
+    2026-07-26 라이브 실측: 24h 신규 시뮬 중 Sharpe>=1.58 이 59건인데 전원
+    fitness 0.49~0.69 (컷 1.0 미달) + turnover 0.48~1.17 — 고샤프 영역 자체가
+    초고회전 구역이라 Fitness 벽에서 전멸했다. focus 큐(라운드당 1개)로는 이
+    광맥을 못 다 캐므로, 탐색 라운드가 이 풀에서 부모를 뽑아 improve_layer 의
+    HT 변형(trade_when·decay 증폭·창 축소)을 결정론으로 주입한다.
+    code_hash 당 최고 sharpe 1개, sharpe 내림차순 top 개.
+    """
+    init()
+    # region 필터 — combine_pool 과 같은 이유(리전 교체 시 옛 필드는 존재하지 않음).
+    _rf = " AND UPPER(COALESCE(region, ''))=? " if region else ''
+    _args = ([user_id, float(min_sharpe), float(max_fitness), float(min_turnover)]
+             + ([str(region).upper()] if region else []) + [int(window)])
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, code, code_hash, metrics, sharpe, fitness, turnover, '
+            'universe, neutralization, decay, truncation '
+            "FROM alphas WHERE user_id=? AND TRIM(error_text)='' "
+            'AND sharpe >= ? AND fitness IS NOT NULL AND fitness < ? '
+            'AND turnover IS NOT NULL AND turnover > ?' + _rf +
+            ' ORDER BY id DESC LIMIT ?',
+            tuple(_args),
+        ).fetchall()
+    best_by_code: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        d = dict(r)
+        try:
+            d['metrics'] = json.loads(d.get('metrics') or '{}')
+        except (TypeError, ValueError):
+            d['metrics'] = {}
+        key = d.get('code_hash') or d.get('code') or ''
+        prev = best_by_code.get(key)
+        if prev is None or float(d.get('sharpe') or 0) > float(prev.get('sharpe') or 0):
+            best_by_code[key] = d
+    out = sorted(best_by_code.values(),
+                 key=lambda d: float(d.get('sharpe') or 0), reverse=True)
+    return out[:int(top)]
 
 
 def operator_preference_stats(user_id: int, lookback_alphas: int = 200,
@@ -1339,6 +2289,24 @@ def list_logs_since(user_id: int, since_id: int = 0, limit: int = 500) -> list[d
     return [dict(r) for r in rows]
 
 
+def list_logs_tail(user_id: int, n: int = 1500) -> list[dict[str, Any]]:
+    """마지막 n 줄(비우기 지점 존중, ID 오름차순) — 초기 로딩용.
+
+    2026-07-26: 로그 106k 행 시점에 초기 로딩이 backlog 전체(최대 30k 줄, 60 GET)를
+    재생하느라 수십 초 걸렸다. 화면 DOM 캡이 5000줄이라 그 대부분은 그리자마자
+    버려지는 낭비 — 처음부터 꼬리만 준다.
+    """
+    init()
+    since = get_last_cleared_log_id(user_id)
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT id, round_num, ts, level, line FROM logs '
+            'WHERE user_id=? AND id>? ORDER BY id DESC LIMIT ?',
+            (user_id, int(since), int(n)),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 def latest_log_id(user_id: int) -> int:
     init()
     with _DB_LOCK, _connect() as conn:
@@ -1370,12 +2338,14 @@ def list_rounds(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def bandit_update(user_id: int, arm_key: str, reward: float, round_num: int,
-                  *, dimension: str = '', decay_k: float = 0.0) -> None:
+                  *, dimension: str = '', decay_k: float = 0.0,
+                  passed: bool = False) -> None:
     """arm 의 보상 통계를 갱신(upsert). 알파 완료마다 즉시 flush.
 
     decay_k>0 이면 기존 통계에 exp(-decay_k*(round_num-last_round)) 시간감쇠를 적용한 뒤
     새 reward 를 더한다 (오래된 보상의 가중치를 줄임). visits 는 감쇠하지 않는다
     (UCB 탐험 항 분모를 안정적으로 유지하기 위해 원시 카운트 보존).
+    passed=True 면 pass_sum 도 +1 — yield(=pass_sum/visits) 의 분자다 (v8, 감쇠 없음).
     """
     r = _coerce_float_or_none(reward)
     if r is None:
@@ -1384,7 +2354,7 @@ def bandit_update(user_id: int, arm_key: str, reward: float, round_num: int,
     init()
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
-            'SELECT reward_sum, reward_sq_sum, visits, last_round, dimension '
+            'SELECT reward_sum, reward_sq_sum, visits, last_round, dimension, pass_sum '
             'FROM bandit_arms WHERE user_id=? AND arm_key=?',
             (user_id, arm_key),
         ).fetchone()
@@ -1393,6 +2363,7 @@ def bandit_update(user_id: int, arm_key: str, reward: float, round_num: int,
             rss = float(row['reward_sq_sum'])
             vis = int(row['visits'])
             lr = int(row['last_round'])
+            ps = int(row['pass_sum'] or 0) + (1 if passed else 0)
             new_last_round = max(lr, int(round_num))
             new_dim = dimension or row['dimension']
             if decay_k > 0:
@@ -1404,15 +2375,17 @@ def bandit_update(user_id: int, arm_key: str, reward: float, round_num: int,
             vis += 1
             conn.execute(
                 'UPDATE bandit_arms SET reward_sum=?, reward_sq_sum=?, visits=?, '
-                'last_round=?, updated_at=?, dimension=? WHERE user_id=? AND arm_key=?',
-                (rs, rss, vis, new_last_round, now, new_dim, user_id, arm_key),
+                'last_round=?, updated_at=?, dimension=?, pass_sum=? '
+                'WHERE user_id=? AND arm_key=?',
+                (rs, rss, vis, new_last_round, now, new_dim, ps, user_id, arm_key),
             )
         else:
             conn.execute(
                 'INSERT INTO bandit_arms (user_id, arm_key, dimension, '
-                'reward_sum, reward_sq_sum, visits, last_round, updated_at) '
-                'VALUES (?,?,?,?,?,?,?,?)',
-                (user_id, arm_key, dimension or '', r, r * r, 1, round_num, now),
+                'reward_sum, reward_sq_sum, visits, last_round, updated_at, pass_sum) '
+                'VALUES (?,?,?,?,?,?,?,?,?)',
+                (user_id, arm_key, dimension or '', r, r * r, 1, round_num, now,
+                 1 if passed else 0),
             )
 
 
@@ -1427,13 +2400,15 @@ def bandit_stats(user_id: int, dimension: str | None = None) -> list[dict[str, A
     with _DB_LOCK, _connect() as conn:
         if dimension is not None:
             rows = conn.execute(
-                'SELECT arm_key, dimension, visits, reward_sum, reward_sq_sum, last_round '
+                'SELECT arm_key, dimension, visits, reward_sum, reward_sq_sum, '
+                'last_round, pass_sum '
                 'FROM bandit_arms WHERE user_id=? AND dimension=? ORDER BY id ASC',
                 (user_id, dimension),
             ).fetchall()
         else:
             rows = conn.execute(
-                'SELECT arm_key, dimension, visits, reward_sum, reward_sq_sum, last_round '
+                'SELECT arm_key, dimension, visits, reward_sum, reward_sq_sum, '
+                'last_round, pass_sum '
                 'FROM bandit_arms WHERE user_id=? ORDER BY id ASC',
                 (user_id,),
             ).fetchall()
@@ -1442,6 +2417,7 @@ def bandit_stats(user_id: int, dimension: str | None = None) -> list[dict[str, A
         vis = int(row['visits'])
         rs = float(row['reward_sum'])
         rss = float(row['reward_sq_sum'])
+        ps = int(row['pass_sum'] or 0)
         mean = rs / vis if vis > 0 else 0.0
         var = max(0.0, rss / vis - mean * mean) if vis > 0 else 0.0
         out.append({
@@ -1453,16 +2429,217 @@ def bandit_stats(user_id: int, dimension: str | None = None) -> list[dict[str, A
             'reward_sum': rs,
             'reward_sq_sum': rss,
             'last_round': int(row['last_round']),
+            'pass_sum': ps,
+            # Yield Score (ACE) — 시뮬 1건당 게이트 통과율. 원시비율(스무딩 없음);
+            # 배분에 섞을 때는 호출부가 라플라스 스무딩한다.
+            'yield': (ps / vis) if vis > 0 else 0.0,
         })
     return out
 
 
+def submit_queue_add(user_id: int, *, wqb_alpha_id: str, kind: str,
+                     code: str = '', alpha_pk: int | None = None,
+                     note: str = '', metrics: dict | None = None) -> bool:
+    """제출 대기 큐에 추가. (user, wid, kind) 중복은 무시. → 새로 넣었으면 True."""
+    wid = str(wqb_alpha_id or '').strip()
+    if not wid:
+        return False
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            'INSERT OR IGNORE INTO submit_queue '
+            '(user_id, alpha_pk, wqb_alpha_id, code, kind, note, metrics, ts, updated_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?)',
+            (user_id, alpha_pk, wid, str(code or ''), kind, str(note or '')[:300],
+             json.dumps(dict(metrics or {}), ensure_ascii=False),
+             time.time(), time.time()))
+        return cur.rowcount > 0
+
+
+#: 대기 큐에서 **내려가는** 상태 — 사람이 더 할 일이 없는 종착점.
+#:   skipped   = 더 이상 낼 일이 없다고 결론난 것 (2026-07-27 사장 지시)
+#:   submitted = 제출에 성공한 것. 성공하면 즉시 내린다 (2026-07-28 사장 지시) —
+#:               '대기' 목록에 이미 끝난 것이 남아 있으면 목록의 뜻이 흐려진다.
+_QUEUE_DONE_STATUSES = ('skipped', 'submitted')
+
+
+def submit_queue_list(user_id: int, limit: int = 1000,
+                      include_skipped: bool = False) -> list[dict[str, Any]]:
+    """대기 큐 목록. **끝난 항목(skipped·submitted)은 기본 제외**.
+
+    limit 기본이 60 이던 때는 pending 이 182건이어도 화면에 최신 60건만 보였다
+    (가장 먼저 드레인될 오래된 건이 목록에서 사라졌다). 쪽 나누기는 화면에서 한다.
+
+    남아야 하는 건 '아직 판단·행동이 필요한 것' 뿐이다. 감사 목적이면
+    include_skipped=True 로 전부 볼 수 있다(제출 내역의 scope='all' 과 같은 규칙).
+    """
+    init()
+    _ph = ','.join('?' * len(_QUEUE_DONE_STATUSES))
+    _f = '' if include_skipped else f" AND COALESCE(status,'') NOT IN ({_ph})"
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            f'SELECT * FROM submit_queue WHERE user_id=?{_f} ORDER BY id DESC LIMIT ?',
+            (user_id, *(() if include_skipped else _QUEUE_DONE_STATUSES),
+             int(limit))).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d['metrics'] = json.loads(d.get('metrics') or '{}')
+        except (TypeError, ValueError):
+            d['metrics'] = {}
+        out.append(d)
+    return out
+
+
+def submit_queue_get(qid: int) -> dict[str, Any] | None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        r = conn.execute('SELECT * FROM submit_queue WHERE id=?', (int(qid),)).fetchone()
+    if r is None:
+        return None
+    d = dict(r)
+    try:
+        d['metrics'] = json.loads(d.get('metrics') or '{}')
+    except (TypeError, ValueError):
+        d['metrics'] = {}
+    return d
+
+
+def submit_queue_delete(user_id: int, ids) -> int:
+    """대기 큐에서 지정한 행을 **영구 삭제**. 지운 개수 반환.
+
+    본인 행만 지운다(user_id 조건) — 큐는 사용자별 제출 예약이라 남의 것을 지우면
+    그 사람의 제출이 사라진다. 존재하지 않는 id 는 조용히 무시한다(멱등).
+    """
+    wanted = [int(i) for i in (ids or []) if str(i).strip().lstrip('-').isdigit()]
+    if not wanted:
+        return 0
+    init()
+    with _DB_LOCK, _connect() as conn:
+        ph = ','.join('?' * len(wanted))
+        cur = conn.execute(
+            f'DELETE FROM submit_queue WHERE user_id=? AND id IN ({ph})',
+            (user_id, *wanted))
+        return int(cur.rowcount or 0)
+
+
+def submit_queue_mark(qid: int, status: str, note: str | None = None) -> None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        if note is None:
+            conn.execute('UPDATE submit_queue SET status=?, updated_at=? WHERE id=?',
+                         (status, time.time(), int(qid)))
+        else:
+            conn.execute(
+                'UPDATE submit_queue SET status=?, note=?, updated_at=? WHERE id=?',
+                (status, str(note)[:300], time.time(), int(qid)))
+
+
+QUEUE_REJECTED_TTL_S = 24 * 3600
+
+
+def submit_queue_purge_rejected(user_id: int, now: float | None = None,
+                                ttl_s: float = QUEUE_REJECTED_TTL_S) -> int:
+    """WQB 가 거절한 대기 건을 거절 24시간 뒤 지운다 (2026-09-25 사장 지시).
+
+    '거절' = WQB 에 실제로 냈다가 403 을 받은 것 — 노트가 'rejected:' 를 담는다
+    (rejected 로 남긴 것·손절로 skipped 에 내린 것 둘 다). 로컬 게이트가 보류만 한 건
+    (범위 불일치 등, 노트에 'rejected:' 없음)과 쿼터 대기(pending)는 건드리지 않는다.
+    시계는 마지막 상태 변경(updated_at) — 재시도해 다시 거절되면 24시간이 새로 시작된다.
+    """
+    cutoff = (time.time() if now is None else now) - ttl_s
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM submit_queue WHERE user_id=? AND status IN ('rejected','skipped') "
+            "AND note LIKE '%rejected:%' AND COALESCE(NULLIF(updated_at,0), ts) < ?",
+            (user_id, cutoff))
+        return cur.rowcount
+
+
+def submit_queue_requeue(user_id: int, min_sharpe: float, note: str) -> int:
+    """제출 안 된 대기 건(rejected·skipped)을 전부 pending(budget)으로 되돌린다 — 일괄 재시도.
+
+    샤프가 min_sharpe 미만인 건은 제외한다(WQB 최저선 아래라 다시 내도 안 된다).
+    theme 칸은 자동 드레인이 안 보므로 budget 으로 옮긴다. 같은 알파의 budget 행이
+    이미 있으면 그 행만 되살아난다(OR IGNORE).
+    """
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cond = ("user_id=? AND status IN ('rejected','skipped') "
+                "AND CAST(json_extract(metrics,'$.sharpe') AS REAL) >= ?")
+        conn.execute(f"UPDATE OR IGNORE submit_queue SET kind='budget' "
+                     f"WHERE kind='theme' AND {cond}", (user_id, float(min_sharpe)))
+        cur = conn.execute(
+            f"UPDATE submit_queue SET status='pending', note=?, updated_at=? "
+            f"WHERE kind='budget' AND {cond}",
+            (str(note)[:300], time.time(), user_id, float(min_sharpe)))
+        return cur.rowcount
+
+
+def submit_queue_next_pending(user_id: int, kind: str = 'budget') -> dict[str, Any] | None:
+    """가장 오래된 pending 1건 (자동 드레인용 — kind='budget' 만 자동 소비)."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        r = conn.execute(
+            "SELECT * FROM submit_queue WHERE user_id=? AND kind=? AND status='pending' "
+            'ORDER BY id ASC LIMIT 1', (user_id, kind)).fetchone()
+    if r is None:
+        return None
+    d = dict(r)
+    try:
+        d['metrics'] = json.loads(d.get('metrics') or '{}')
+    except (TypeError, ValueError):
+        d['metrics'] = {}
+    return d
+
+
+def superalpha_start(user_id: int, seed_plus: int, selection: str) -> int:
+    """슈퍼알파 런 시작 기록 → run_id."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            'INSERT INTO superalpha_runs (user_id, ts, status, seed_plus, selection) '
+            'VALUES (?,?,?,?,?)',
+            (user_id, time.time(), 'running', int(seed_plus), selection))
+        return int(cur.lastrowid)
+
+
+def superalpha_finish(run_id: int, status: str, results: list[dict],
+                      error: str = '') -> None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            'UPDATE superalpha_runs SET status=?, results=?, error=? WHERE id=?',
+            (status, json.dumps(results, ensure_ascii=False), error[:600],
+             int(run_id)))
+
+
+def superalpha_runs_list(user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT * FROM superalpha_runs WHERE user_id=? ORDER BY id DESC LIMIT ?',
+            (user_id, int(limit))).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d['results'] = json.loads(d.get('results') or '[]')
+        except (TypeError, ValueError):
+            d['results'] = []
+        out.append(d)
+    return out
+
+
 def bandit_arm(user_id: int, arm_key: str) -> dict[str, Any] | None:
-    """단일 arm dict 또는 None. 반환 키: arm_key, dimension, visits, mean, var, reward_sum, reward_sq_sum, last_round."""
+    """단일 arm dict 또는 None. 반환 키: bandit_stats 와 동일 (pass_sum/yield 포함)."""
     init()
     with _DB_LOCK, _connect() as conn:
         row = conn.execute(
-            'SELECT arm_key, dimension, visits, reward_sum, reward_sq_sum, last_round '
+            'SELECT arm_key, dimension, visits, reward_sum, reward_sq_sum, '
+            'last_round, pass_sum '
             'FROM bandit_arms WHERE user_id=? AND arm_key=?',
             (user_id, arm_key),
         ).fetchone()
@@ -1471,6 +2648,7 @@ def bandit_arm(user_id: int, arm_key: str) -> dict[str, Any] | None:
     vis = int(row['visits'])
     rs = float(row['reward_sum'])
     rss = float(row['reward_sq_sum'])
+    ps = int(row['pass_sum'] or 0)
     mean = rs / vis if vis > 0 else 0.0
     var = max(0.0, rss / vis - mean * mean) if vis > 0 else 0.0
     return {
@@ -1482,6 +2660,8 @@ def bandit_arm(user_id: int, arm_key: str) -> dict[str, Any] | None:
         'reward_sum': rs,
         'reward_sq_sum': rss,
         'last_round': int(row['last_round']),
+        'pass_sum': ps,
+        'yield': (ps / vis) if vis > 0 else 0.0,
     }
 
 
@@ -1691,6 +2871,394 @@ def round_reward_trend(user_id: int, window: int = 10) -> float:
     return (n * sum_xy - sum_x * sum_y) / denom
 
 
+def directive_stats(user_id: int, window_edges: int = 800
+                    ) -> dict[tuple[str, str], dict[str, Any]]:
+    """정향변이 학습 관측 집계 — (부모 fail category, 적용 directive) → 성공 통계.
+
+    부모→자식 귀속 엣지(alphas.parent_alpha_id + alphas.directive) 중 최근
+    window_edges 개를 mutation_learn.outcome_observations 로 채점해 합산한다.
+    반환: {(category, directive): {'n': int, 'wins': int, 'win_rate': float}}.
+    엣지가 없으면 빈 dict — choose_directive 가 사전확률(규칙)로 폴백한다.
+    """
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT c.directive AS directive, c.pass_count AS c_pass, '
+            '  c.fail_items AS c_fail, c.error_text AS c_err, c.metrics AS c_met, '
+            '  p.pass_count AS p_pass, p.fail_items AS p_fail, p.metrics AS p_met '
+            'FROM alphas c JOIN alphas p ON p.id = c.parent_alpha_id '
+            'WHERE c.user_id=? AND c.directive IS NOT NULL '
+            "AND TRIM(c.directive) <> '' "
+            'ORDER BY c.id DESC LIMIT ?',
+            (user_id, int(window_edges)),
+        ).fetchall()
+
+    from . import mutation_learn as _ml
+
+    def _j(s):
+        try:
+            v = json.loads(s or '{}')
+            return v if isinstance(v, dict) else {}
+        except Exception:
+            return {}
+
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in rows:
+        try:
+            p_fail = json.loads(r['p_fail'] or '[]')
+            c_fail = json.loads(r['c_fail'] or '[]')
+        except Exception:
+            continue
+        # metrics 를 반드시 함께 넘긴다 — outcome_observations 의 '표적 지표가 나아졌나'
+        # 판정(부분 전진)이 이것 없이는 동작하지 않고, 그러면 학습이 전 축 0승으로 죽는다.
+        obs = _ml.outcome_observations(
+            {'fail_items': p_fail, 'pass_count': r['p_pass'],
+             'metrics': _j(r['p_met'])},
+            {'fail_items': c_fail, 'pass_count': r['c_pass'],
+             'directive': r['directive'], 'error_text': r['c_err'],
+             'metrics': _j(r['c_met'])})
+        for cat, d, win in obs:
+            st = out.setdefault((cat, d), {'n': 0, 'wins': 0})
+            st['n'] += 1
+            st['wins'] += 1 if win else 0
+    for st in out.values():
+        st['win_rate'] = (st['wins'] / st['n']) if st['n'] else 0.0
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v7: 백엔드 능력 (역할 account_type 과 분리된 '측정된 사실')
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_backend(user_id: int) -> str:
+    """'api' | '' (미탐침). 역할이 아니라 **측정된 전송 능력**이다.
+    (구 'browser' 값은 Playwright 제거로 폐기 — 남은 행은 워커가 재탐침해 'api' 로 치유한다.)"""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute('SELECT backend FROM users WHERE id=?', (user_id,)).fetchone()
+    return str((row['backend'] if row else '') or '')
+
+
+@_with_conn
+def set_backend(conn, user_id: int, backend: str) -> None:
+    if backend not in ('api', ''):     # 'browser' 는 Playwright 제거로 폐기(2026-07-13)
+        raise ValueError(f'invalid backend: {backend!r}')
+    conn.execute('UPDATE users SET backend=? WHERE id=?', (backend, user_id))
+
+
+def recent_fail_counts(user_id: int, limit: int = 400) -> dict[str, int]:
+    """최근 `limit` 알파의 FAIL 체크 이름별 건수. 자율 이데이션이 '병목' 을 말할 근거."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT fail_items FROM alphas WHERE user_id=? '
+            "AND TRIM(error_text)='' ORDER BY id DESC LIMIT ?",
+            (user_id, int(limit)),
+        ).fetchall()
+    out: dict[str, int] = {}
+    for r in rows:
+        try:
+            items = json.loads(r['fail_items'] or '[]')
+        except Exception:
+            continue
+        for it in items:
+            name = (it.get('name') if isinstance(it, dict) else str(it)) or ''
+            name = str(name).strip()
+            if name:
+                out[name] = out.get(name, 0) + 1
+    return out
+
+
+def recent_family_counts(user_id: int, limit: int = 400) -> dict[str, int]:
+    """최근 `limit` 알파가 쓴 유전체 family 별 건수. 탐색 공백(안 써본 패밀리) 근거."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT genome FROM alphas WHERE user_id=? AND genome IS NOT NULL '
+            'ORDER BY id DESC LIMIT ?',
+            (user_id, int(limit)),
+        ).fetchall()
+    out: dict[str, int] = {}
+    for r in rows:
+        try:
+            g = json.loads(r['genome'] or '{}')
+        except Exception:
+            continue
+        fam = str((g or {}).get('family') or '').strip()
+        if fam:
+            out[fam] = out.get(fam, 0) + 1
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v7: 리서치 런 / 가설 / 전략스펙
+# ─────────────────────────────────────────────────────────────────────────────
+
+RESEARCH_STATUSES = ('pending', 'gathering', 'ideating', 'concretizing', 'ready', 'error')
+
+
+def create_research_run(user_id: int, query: str) -> int:
+    init()
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            'INSERT INTO research_runs (user_id, query, status, created_at, updated_at) '
+            "VALUES (?,?,'pending',?,?)",
+            (user_id, str(query or '').strip(), now, now),
+        )
+        return int(cur.lastrowid)
+
+
+def update_research_run(run_id: int, *, status: str | None = None,
+                        evidence: str | None = None, sources: list | None = None,
+                        error: str | None = None) -> None:
+    init()
+    sets, vals = [], []
+    if status is not None:
+        if status not in RESEARCH_STATUSES:
+            raise ValueError(f'invalid research status: {status!r}')
+        sets.append('status=?'); vals.append(status)
+    if evidence is not None:
+        sets.append('evidence=?'); vals.append(str(evidence))
+    if sources is not None:
+        sets.append('sources=?'); vals.append(json.dumps(list(sources), ensure_ascii=False))
+    if error is not None:
+        sets.append('error=?'); vals.append(str(error)[:600])
+    if not sets:
+        return
+    sets.append('updated_at=?'); vals.append(time.time())
+    vals.append(run_id)
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(f'UPDATE research_runs SET {", ".join(sets)} WHERE id=?', vals)
+
+
+def _research_view(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    try:
+        d['sources'] = json.loads(d.get('sources') or '[]')
+    except Exception:
+        d['sources'] = []
+    return d
+
+
+def get_research_run(run_id: int) -> dict[str, Any] | None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute('SELECT * FROM research_runs WHERE id=?', (run_id,)).fetchone()
+    return _research_view(row) if row else None
+
+
+def latest_research_run(user_id: int) -> dict[str, Any] | None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            'SELECT * FROM research_runs WHERE user_id=? ORDER BY id DESC LIMIT 1',
+            (user_id,)).fetchone()
+    return _research_view(row) if row else None
+
+
+def insert_hypothesis(run_id: int, user_id: int, h: dict[str, Any]) -> int:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            'INSERT INTO hypotheses (run_id, user_id, title, rationale, citations, '
+            'family_hint, created_at) VALUES (?,?,?,?,?,?,?)',
+            (run_id, user_id, str(h.get('title') or '')[:200],
+             str(h.get('rationale') or '')[:2000],
+             json.dumps(list(h.get('citations') or []), ensure_ascii=False),
+             str(h.get('family_hint') or '')[:40], time.time()),
+        )
+        return int(cur.lastrowid)
+
+
+# ── 페이스메이커 조회 (2026-07-31) ───────────────────────────────────────────
+@_with_conn
+def pass_count_since(conn, user_id: int, since_ts: float) -> int:
+    """since_ts 이후 전 체크 통과 알파 수 — 발굴 페이스 실측."""
+    row = conn.execute(
+        'SELECT COUNT(*) FROM alphas WHERE user_id=? AND ts>=? '
+        'AND pass_count>0 AND fail_count=0', (user_id, since_ts)).fetchone()
+    return int(row[0] or 0)
+
+
+@_with_conn
+def recent_alpha_material(conn, user_id: int, since_ts: float) -> list[tuple]:
+    """(genome_json, code) 목록 — 패밀리/필드 사용 빈도 집계용."""
+    return [(r[0] or '', r[1] or '') for r in conn.execute(
+        'SELECT genome, code FROM alphas WHERE user_id=? AND ts>=?',
+        (user_id, since_ts))]
+
+
+@_with_conn
+def error_count_like(conn, user_id: int, since_ts: float, pattern: str) -> int:
+    """since_ts 이후 error_text LIKE 패턴 건수 — 인증 사망 등 감지."""
+    row = conn.execute(
+        'SELECT COUNT(*) FROM alphas WHERE user_id=? AND ts>=? AND error_text LIKE ?',
+        (user_id, since_ts, pattern)).fetchone()
+    return int(row[0] or 0)
+
+
+@_with_conn
+def submitted_count_since(conn, user_id: int, since_ts: float) -> int:
+    """since_ts 이후 WQB 제출 성사 수 — 자동 제출 푸시 목표 실측."""
+    row = conn.execute(
+        'SELECT COUNT(*) FROM alphas WHERE user_id=? AND ts>=? AND submitted=1',
+        (user_id, since_ts)).fetchone()
+    return int(row[0] or 0)
+
+
+@_with_conn
+def submitted_metrics_since(conn, user_id: int, since_ts: float) -> list[str]:
+    """제출(OS)된 알파의 metrics JSON — 피라미드 칸별 보유 수 집계용."""
+    return [r[0] or '' for r in conn.execute(
+        'SELECT metrics FROM alphas WHERE user_id=? AND ts>=? AND submitted=1',
+        (user_id, since_ts))]
+
+
+@_with_conn
+def code_pyramid_pairs(conn) -> list[tuple]:
+    """(code, pyramids) 쌍 — 데이터셋→피라미드 카테고리 사상을 실측으로 학습한다.
+    제출 여부와 무관하다. 체크를 받아 본 알파면 WQB 가 칸을 이미 알려줬다."""
+    return [(r[0] or '', r[1] or '') for r in conn.execute(
+        "SELECT code, json_extract(metrics, '$.pyramids') FROM alphas "
+        "WHERE metrics LIKE '%pyramids%'")
+        if r[1]]
+
+
+@_with_conn
+def code_sharpe_submitted_since(conn, user_id: int, since_ts: float) -> list[tuple]:
+    """(code, sharpe, submitted) 목록 — 축 소진/죽은 축 판정용."""
+    return [(r[0] or '', r[1], int(r[2] or 0)) for r in conn.execute(
+        'SELECT code, sharpe, submitted FROM alphas WHERE user_id=? AND ts>=?',
+        (user_id, since_ts))]
+
+
+@_with_conn
+def prod_corr_rejected(conn, user_id: int, since_ts: float) -> list[dict]:
+    """PROD_CORRELATION 이 실린 채 막힌 알파들 — 상관 완화 변주의 원본 후보.
+
+    값이 확실히 들어오는 곳은 403 본문(=submit_status)과 발사 전 가드 두 곳뿐이다.
+    `/alphas/{id}/correlations/prod` 는 준비 여부와 무관하게 빈 본문을 준다(2026-08-13 실측).
+    """
+    return [{'code': r[0] or '', 'sharpe': r[1], 'universe': r[2] or '',
+             'delay': r[3], 'neutralization': (r[4] or '').upper(),
+             'decay': r[5], 'truncation': r[6], 'status': r[7] or '', 'ts': r[8],
+             'genome': r[9] or ''}
+            for r in conn.execute(
+                'SELECT code, sharpe, universe, delay, neutralization, decay, truncation, '
+                'submit_status, ts, genome FROM alphas '
+                'WHERE user_id=? AND ts>=? AND submitted=0 AND code IS NOT NULL '
+                "AND (submit_status LIKE '%PROD_CORRELATION(%' OR submit_status LIKE '%prod_corr(%') "
+                'ORDER BY ts DESC', (user_id, since_ts))]
+
+
+@_with_conn
+def latest_run_id(conn, user_id: int) -> int:
+    row = conn.execute(
+        'SELECT MAX(run_id) FROM hypotheses WHERE user_id=?', (user_id,)).fetchone()
+    return int(row[0] or 0)
+
+
+@_with_conn
+def last_hypothesis_ts(conn, user_id: int, title_prefix: str) -> float | None:
+    """title 이 prefix 로 시작하는 최신 가설 시각 — 자동 시딩 쿨다운용."""
+    row = conn.execute(
+        'SELECT MAX(created_at) FROM hypotheses WHERE user_id=? AND title LIKE ?',
+        (user_id, title_prefix + '%')).fetchone()
+    return float(row[0]) if row and row[0] is not None else None
+
+
+def list_hypotheses(run_id: int) -> list[dict[str, Any]]:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT * FROM hypotheses WHERE run_id=? ORDER BY id ASC', (run_id,)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d['citations'] = json.loads(d.get('citations') or '[]')
+        except Exception:
+            d['citations'] = []
+        out.append(d)
+    return out
+
+
+def insert_spec(hypothesis_id: int, user_id: int, *, genome: dict, code: str,
+                settings: dict | None = None, delay=None, why: str = '') -> int:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            'INSERT INTO strategy_specs (hypothesis_id, user_id, genome, code, settings, '
+            "delay, status, why, created_at) VALUES (?,?,?,?,?,?,'pending',?,?)",
+            (hypothesis_id, user_id,
+             json.dumps(dict(genome), ensure_ascii=False), str(code),
+             json.dumps(dict(settings or {}), ensure_ascii=False),
+             int(delay) if str(delay).lstrip('-').isdigit() else None,
+             str(why or '')[:500], time.time()),
+        )
+        return int(cur.lastrowid)
+
+
+def _spec_view(row: sqlite3.Row) -> dict[str, Any]:
+    d = dict(row)
+    for k, empty in (('genome', '{}'), ('settings', '{}')):
+        try:
+            d[k] = json.loads(d.get(k) or empty)
+        except Exception:
+            d[k] = {}
+    return d
+
+
+def pending_specs(user_id: int, limit: int = 8) -> list[dict[str, Any]]:
+    """GA 가 다음 라운드에 소비할 미시딩 전략스펙 (오래된 것부터)."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM strategy_specs WHERE user_id=? AND status='pending' "
+            'ORDER BY id ASC LIMIT ?', (user_id, int(limit))).fetchall()
+    return [_spec_view(r) for r in rows]
+
+
+def mark_specs(spec_ids, status: str, *, seeded_round: int | None = None) -> None:
+    ids = [int(i) for i in (spec_ids or [])]
+    if not ids:
+        return
+    if status not in ('pending', 'seeded', 'exhausted', 'rejected'):
+        raise ValueError(f'invalid spec status: {status!r}')
+    init()
+    ph = ','.join('?' * len(ids))
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            f'UPDATE strategy_specs SET status=?, seeded_round=? WHERE id IN ({ph})',
+            (status, seeded_round, *ids))
+
+
+@_with_conn
+def attach_spec_alpha(conn, spec_id: int, alpha_id: int) -> None:
+    conn.execute('UPDATE strategy_specs SET alpha_id=? WHERE id=?',
+                 (int(alpha_id), int(spec_id)))
+
+
+def spec_counts(user_id: int) -> dict[str, int]:
+    """상태별 스펙 수 — 대시보드 진행률."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT status, COUNT(*) AS n FROM strategy_specs WHERE user_id=? '
+            'GROUP BY status', (user_id,)).fetchall()
+    return {str(r['status']): int(r['n']) for r in rows}
+
+
+def list_specs_for_run(run_id: int) -> list[dict[str, Any]]:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT s.* FROM strategy_specs s JOIN hypotheses h ON h.id = s.hypothesis_id '
+            'WHERE h.run_id=? ORDER BY s.id ASC', (run_id,)).fetchall()
+    return [_spec_view(r) for r in rows]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # P4 meta-strategy helpers — read-only SELECTs, no schema change
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1766,3 +3334,493 @@ def survivor_alphas(user_id: int, n: int = 6, min_pass: int = 5) -> list[dict]:
         return out
     except Exception:
         return []
+
+
+# ── 위원회(committee) 근거 + 제출 재시도 헬퍼 (2026-07-23) ───────────────────
+
+def pocket_stats(user_id: int, days: int = 7, limit: int = 20) -> list[dict[str, Any]]:
+    """최근 N일 (delay, universe, neutralization) 구역별 실측 요약 — 위원회 근거용.
+
+    n 내림차순. avg_sharpe 는 소수 3자리 문자열이 아니라 float (LLM 프롬프트에 그대로
+    들어가므로 round 처리), hi = |sharpe| >= 1.25 개수(D1 표준컷 1.58 의 예열 지표).
+    """
+    init()
+    since = time.time() - days * 86400.0
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT delay, universe, neutralization, COUNT(*) n, '
+            'ROUND(AVG(sharpe), 3) avg_sharpe, '
+            'SUM(CASE WHEN ABS(sharpe) >= 1.25 THEN 1 ELSE 0 END) hi '
+            'FROM alphas WHERE user_id=? AND ts>? AND sharpe IS NOT NULL '
+            'GROUP BY delay, universe, neutralization '
+            'ORDER BY n DESC LIMIT ?',
+            (user_id, since, int(limit)),
+        ).fetchall()
+    return [{'delay': r['delay'], 'universe': r['universe'] or '?',
+             'neutralization': r['neutralization'] or '?', 'n': int(r['n']),
+             'avg_sharpe': r['avg_sharpe'], 'hi': int(r['hi'] or 0)} for r in rows]
+
+
+def rejection_stats(user_id: int, days: int = 7, limit: int = 12) -> dict[str, int]:
+    """최근 N일 제출 거절/보류 사유 상위 — 위원회의 탈상관 심사역이 주로 읽는다."""
+    init()
+    since = time.time() - days * 86400.0
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT submit_status s, COUNT(*) n FROM submit_attempts "
+            "WHERE user_id=? AND ts>? AND TRIM(submit_status) <> '' "
+            "AND submit_status NOT LIKE 'submit_skipped:paused%' "
+            'GROUP BY submit_status ORDER BY n DESC LIMIT ?',
+            (user_id, since, int(limit)),
+        ).fetchall()
+    return {str(r['s'])[:120]: int(r['n']) for r in rows}
+
+
+# 제출 재시도 대상 상태 — **일시 장애**만. rejected: 는 WQB 의 확정 판정이라 제외.
+_STUCK_SUBMIT_PREFIXES = ('submit_pending_timeout', 'submit_http_502',
+                          'submit_http_504', 'submit_http_429', 'submit_http_500')
+
+
+def stuck_submits(user_id: int, *, since_s: float = 172800.0,
+                  limit: int = 5) -> list[dict[str, Any]]:
+    """일시 장애로 제출이 끊겼지만 **차단 FAIL 0** 이었던 알파 — 재시도 후보.
+
+    같은 code_hash 로 이미 제출 성공(submitted=1)했거나 확정 거절(rejected:)된 행이
+    있으면 제외한다 — 같은 식을 다시 내면 어차피 같은 판정이다.
+    최신 우선. metrics 는 JSON 파싱해 dict 로 돌려준다 (wqb_alpha_id 가 열쇠).
+    """
+    init()
+    since = time.time() - float(since_s)
+    conds = ' OR '.join(f"submit_status LIKE '{p}%'" for p in _STUCK_SUBMIT_PREFIXES)
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            f'SELECT id, code, code_hash, metrics, genome, submit_status, ts, fail_count, '
+            f'error_count FROM alphas a WHERE user_id=? AND ts>? AND submitted=0 '
+            f'AND ({conds}) AND fail_count=0 AND error_count=0 '
+            "AND NOT EXISTS (SELECT 1 FROM alphas b WHERE b.user_id=a.user_id "
+            'AND b.code_hash=a.code_hash AND (b.submitted=1 OR '
+            "b.submit_status LIKE 'rejected:%')) "
+            'ORDER BY id DESC LIMIT ?',
+            (user_id, since, int(limit)),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+    for r in rows:
+        ch = str(r['code_hash'] or '')
+        if ch in seen_codes:
+            continue
+        seen_codes.add(ch)
+        try:
+            metrics = json.loads(r['metrics']) if r['metrics'] else {}
+        except (TypeError, ValueError):
+            metrics = {}
+        try:
+            genome = json.loads(r['genome']) if r['genome'] else None
+        except (TypeError, ValueError):
+            genome = None
+        out.append({'id': int(r['id']), 'code': r['code'], 'code_hash': ch,
+                    'metrics': metrics if isinstance(metrics, dict) else {},
+                    'genome': genome if isinstance(genome, dict) else None,
+                    'submit_status': r['submit_status'], 'ts': r['ts']})
+    return out
+
+
+def set_alpha_submit_result(alpha_pk: int, submitted: bool,
+                            submit_status: str, *,
+                            user_id: int | None = None, code: str = '') -> None:
+    """재시도한 제출의 최종 상태를 해당 알파 행에 기록한다.
+
+    `alpha_pk` 가 없으면 (user_id, code) 로 찾는다 — 게이트가 대기 큐에 넣는 시점엔
+    alphas 행이 아직 없어 큐 행에 pk 가 안 남는다. pk 만 보던 동안 큐에서 거절된
+    알파의 상세는 `submit_skipped:…→queued` 에 멈춰 있고 **거절 사유가 어디에도
+    안 남았다** (2026-07-30 사장 지적).
+    """
+    pk = int(alpha_pk or 0)
+    init()
+    with _DB_LOCK, _connect() as conn:
+        if pk <= 0:
+            if not (user_id and code):
+                return
+            row = conn.execute(
+                'SELECT id FROM alphas WHERE user_id=? AND code_hash=? ORDER BY id DESC LIMIT 1',
+                (int(user_id), code_hash(code))).fetchone()
+            if row is None:
+                return
+            pk = int(row['id'])
+        # Queue/retry submissions receive the 403 after the alpha row already exists.
+        # Promote PROD/SELF correlation into the same metrics/fail contract used by
+        # fresh simulation results so selection and the next mutation can learn it.
+        try:
+            old = conn.execute(
+                'SELECT metrics,fail_items FROM alphas WHERE id=?', (pk,)).fetchone()
+            metrics = json.loads(old['metrics'] or '{}') if old else {}
+            from . import research_v2 as _v2_policy
+            promoted = _v2_policy.promote_submit_evidence({
+                'metrics': metrics, 'is_status': {'fail': []},
+                'submit_status': str(submit_status or '')})
+            metrics = promoted.get('metrics') or metrics
+            new_fails = [str(x.get('name') or '?')
+                         for x in (promoted.get('is_status') or {}).get('fail', [])]
+            if new_fails:
+                try:
+                    previous = json.loads(old['fail_items'] or '[]') if old else []
+                except (TypeError, ValueError):
+                    previous = []
+                fail_names = list(dict.fromkeys([*previous, *new_fails]))
+            else:
+                fail_names = None
+        except Exception:
+            metrics, fail_names = None, None
+        if metrics is not None and fail_names is not None:
+            conn.execute(
+                'UPDATE alphas SET submitted=?,submit_status=?,metrics=?,fail_items=?,'
+                'fail_count=?,self_corr=? WHERE id=?',
+                (1 if submitted else 0, str(submit_status or '')[:300],
+                 json.dumps(metrics, ensure_ascii=False),
+                 json.dumps(fail_names, ensure_ascii=False), len(fail_names),
+                 _coerce_float_or_none(metrics.get('self_correlation')), pk))
+        elif metrics is not None:
+            conn.execute(
+                'UPDATE alphas SET submitted=?,submit_status=?,metrics=? WHERE id=?',
+                (1 if submitted else 0, str(submit_status or '')[:300],
+                 json.dumps(metrics, ensure_ascii=False), pk))
+        else:
+            conn.execute(
+                'UPDATE alphas SET submitted=?, submit_status=? WHERE id=?',
+                (1 if submitted else 0, str(submit_status or '')[:300], pk))
+
+
+def rejected_fieldsets(user_id: int, *, since_s: float = 86400.0,
+                       min_count: int = 3,
+                       reason_contains: str | None = None) -> list[frozenset]:
+    """최근 N시간 동안 제출이 `rejected:` 로 min_count 회 이상 끝난 **필드 조합**들.
+
+    2026-07-24 실측: 같은 mdl177 3종 필드셋의 변형 19개가 3시간 동안 전부
+    PROD_CORRELATION/LOW_2Y 로 거절됐다 — 상관은 필드(아이디어) 수준 속성이라
+    중립화·감쇠만 바꾼 형제는 같은 벽에 부딪힌다. 이 목록이 제출 게이트의
+    쿨다운 근거가 된다 (시뮬은 계속 하되 **제출만** 보류 — 학습 데이터는 쌓인다).
+
+    reason_contains 를 주면 거절 사유에 그 문자열(대소문자 무시)이 든 행만 센다 —
+    ④ 패밀리 상관벽: 'CORRELATION' + min_count=1 로 부르면 '대표 1회 거절 = 같은
+    필드셋 형제 전원 보류'(AAF 패밀리 트리의 검사 경제화)가 된다.
+    """
+    init()
+    since = time.time() - float(since_s)
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT genome, code, submit_status FROM alphas WHERE user_id=? AND ts>? "
+            "AND submit_status LIKE 'rejected:%'",
+            (user_id, since),
+        ).fetchall()
+    needle = (reason_contains or '').upper()
+    cnt: dict[frozenset, int] = {}
+    for r in rows:
+        if needle and needle not in str(r['submit_status'] or '').upper():
+            continue
+        # 유전체 fields 와 코드 추출 두 표현을 **모두** 센다 — GA 유전체 상당수가
+        # fields 를 안 담아(2026-08-03 실측) 유전체만 보면 벽이 전면 무력화되고,
+        # 코드만 보면 유전체를 쓰는 게이트 측과 표현이 어긋나 매칭이 깨진다.
+        sets: set[frozenset] = set()
+        try:
+            g = json.loads(r['genome'] or '{}')
+            fs = frozenset(str(f) for f in (g.get('fields') or []) if f)
+            if fs:
+                sets.add(fs)
+        except (TypeError, ValueError):
+            pass
+        try:
+            from . import alpha_ast as _ast
+            fs2 = frozenset(_ast.fields_used(str(r['code'] or '')))
+            if fs2:
+                sets.add(fs2)
+        except Exception:
+            pass
+        for fs in sets:
+            cnt[fs] = cnt.get(fs, 0) + 1
+    return [fs for fs, n in cnt.items() if n >= int(min_count)]
+
+
+def submitted_fieldsets(user_id: int, *, since_s: float | None = None) -> list[frozenset]:
+    """**성공 제출된** 알파들의 필드 조합 (기본: 전 기간).
+
+    Power Pool self-corr 풀은 태그를 떼도 남으므로, 한 번 제출한 신호의 형제를
+    다시 만드는 것은 구조적으로 낭비다 — 사냥 사다리가 이 목록을 피해 간다.
+    """
+    init()
+    args: list = [user_id]
+    where = 'user_id=? AND submitted=1 AND genome IS NOT NULL'
+    if since_s:
+        where += ' AND ts>?'
+        args.append(time.time() - float(since_s))
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(f'SELECT genome, code FROM alphas WHERE {where}',
+                            tuple(args)).fetchall()
+    out: set[frozenset] = set()
+    for r in rows:
+        try:
+            g = json.loads(r['genome'])
+            fs = frozenset(str(f) for f in (g.get('fields') or []) if f)
+        except (TypeError, ValueError):
+            fs = frozenset()
+        if not fs:
+            try:
+                from . import alpha_ast as _ast
+                fs = frozenset(_ast.fields_used(r['code'] or ''))
+            except Exception:
+                fs = frozenset()
+        if fs:
+            out.add(fs)
+    return list(out)
+
+
+def submitted_fieldsets_today(user_id: int, now: float | None = None) -> list[frozenset]:
+    """오늘(동부시간 자정 — submitted_today 와 같은 경계) 성공 제출된 알파들의 필드 조합.
+
+    ④ 일일 예산 4칸을 같은 아이디어(필드셋)의 형제들이 잠식하지 않게 하는
+    dedup 근거 — 이미 오늘 낸 필드셋의 형제는 제출을 보류한다.
+    """
+    start = day_start_ts(now)
+    init()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT genome FROM alphas WHERE user_id=? AND ts>=? '
+            'AND submitted=1 AND genome IS NOT NULL', (user_id, start),
+        ).fetchall()
+    out: set[frozenset] = set()
+    for r in rows:
+        try:
+            g = json.loads(r['genome'])
+            fs = frozenset(str(f) for f in (g.get('fields') or []) if f)
+        except (TypeError, ValueError):
+            continue
+        if fs:
+            out.add(fs)
+    return list(out)
+
+
+# ── GenomicWQB 2.0 evidence spine ───────────────────────────────────────────
+
+def v2_register_candidate(user_id: int, round_id: int, round_num: int, idx: int, *,
+                          canonical: dict, lineage: dict, search_mode: str,
+                          spec_id=None, parent_alpha_id=None, genes_changed=None,
+                          policy_version: str = '') -> dict[str, Any]:
+    """Register canonical identity and a preflight experiment atomically."""
+    init()
+    now = time.time()
+    key = str(canonical.get('canonical_key') or '')
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute(
+            'SELECT id, times_seen FROM canonical_alphas '
+            'WHERE user_id=? AND canonical_key=?', (user_id, key)).fetchone()
+        duplicate = row is not None
+        if row is None:
+            cur = conn.execute(
+                'INSERT INTO canonical_alphas '
+                '(user_id,canonical_key,code,code_hash,settings_fp,lineage_key,'
+                'dataset_key,expression_key,first_seen,last_seen,times_seen) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,1)',
+                (user_id, key, str(canonical.get('code') or ''),
+                 code_hash(str(canonical.get('code') or '')),
+                 str(canonical.get('settings_fp') or ''),
+                 str(lineage.get('lineage_key') or ''),
+                 str(lineage.get('dataset_key') or ''),
+                 str(lineage.get('expression_key') or ''), now, now))
+            canonical_id = int(cur.lastrowid)
+            times_seen = 1
+        else:
+            canonical_id = int(row['id'])
+            times_seen = int(row['times_seen'] or 0) + 1
+            conn.execute(
+                'UPDATE canonical_alphas SET last_seen=?, times_seen=? WHERE id=?',
+                (now, times_seen, canonical_id))
+        cur = conn.execute(
+            'INSERT INTO alpha_experiments '
+            '(user_id,round_id,round_num,idx,canonical_id,spec_id,parent_alpha_id,'
+            'search_mode,state,genes_changed,policy_version,created_at,updated_at) '
+            "VALUES (?,?,?,?,?,?,?,?,'PREFLIGHTED',?,?,?,?) "
+            'ON CONFLICT(user_id,round_id,idx) DO UPDATE SET '
+            'canonical_id=excluded.canonical_id, search_mode=excluded.search_mode, '
+            'state=excluded.state, updated_at=excluded.updated_at',
+            (user_id, round_id, round_num, int(idx), canonical_id,
+             int(spec_id) if spec_id is not None else None,
+             int(parent_alpha_id) if parent_alpha_id is not None else None,
+             str(search_mode or ''), json.dumps(list(genes_changed or []), ensure_ascii=False),
+             str(policy_version or ''), now, now))
+        exp = conn.execute(
+            'SELECT id FROM alpha_experiments WHERE user_id=? AND round_id=? AND idx=?',
+            (user_id, round_id, int(idx))).fetchone()
+    return {'canonical_id': canonical_id, 'experiment_id': int(exp['id']),
+            'duplicate': duplicate, 'times_seen': times_seen}
+
+
+def v2_mark_experiment(user_id: int, round_id: int, idx: int, state: str, *,
+                       reason: str = '', alpha_id=None) -> None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute(
+            'UPDATE alpha_experiments SET state=?, reason=?, '
+            'alpha_id=COALESCE(?,alpha_id), updated_at=? '
+            'WHERE user_id=? AND round_id=? AND idx=?',
+            (str(state), str(reason or '')[:500],
+             int(alpha_id) if alpha_id is not None else None,
+             time.time(), user_id, round_id, int(idx)))
+
+
+def v2_record_snapshot(user_id: int, *, kind: str, payload: dict,
+                       alpha_id=None, wqb_alpha_id: str = '',
+                       policy_version: str = '') -> int:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        cur = conn.execute(
+            'INSERT INTO wqb_snapshots '
+            '(user_id,alpha_id,wqb_alpha_id,kind,payload,observed_at,policy_version) '
+            'VALUES (?,?,?,?,?,?,?)',
+            (user_id, int(alpha_id) if alpha_id is not None else None,
+             str(wqb_alpha_id or ''), str(kind),
+             json.dumps(dict(payload or {}), ensure_ascii=False), time.time(),
+             str(policy_version or '')))
+        return int(cur.lastrowid)
+
+
+def v2_close_evidence_card(user_id: int, round_id: int, idx: int, *,
+                           alpha_id=None, conclusion: str = '', confidence: float = 0.5,
+                           evidence: dict | None = None) -> None:
+    init()
+    now = time.time()
+    with _DB_LOCK, _connect() as conn:
+        exp = conn.execute(
+            'SELECT id FROM alpha_experiments WHERE user_id=? AND round_id=? AND idx=?',
+            (user_id, round_id, int(idx))).fetchone()
+        if exp is None:
+            return
+        eid = int(exp['id'])
+        conn.execute(
+            'INSERT INTO evidence_cards '
+            '(user_id,experiment_id,alpha_id,conclusion,confidence,evidence,created_at,updated_at) '
+            'VALUES (?,?,?,?,?,?,?,?) '
+            'ON CONFLICT(user_id,experiment_id) DO UPDATE SET '
+            'alpha_id=excluded.alpha_id, conclusion=excluded.conclusion, '
+            'confidence=excluded.confidence, evidence=excluded.evidence, '
+            'updated_at=excluded.updated_at',
+            (user_id, eid, int(alpha_id) if alpha_id is not None else None,
+             str(conclusion or '')[:500], max(0.0, min(1.0, float(confidence))),
+             json.dumps(dict(evidence or {}), ensure_ascii=False), now, now))
+
+
+def v2_recent_observation_candidates(user_id: int, *, limit: int = 20,
+                                     since_s: float = 172800.0,
+                                     min_interval_s: float = 900.0) -> list[dict[str, Any]]:
+    """Recently submitted/attempted WQB alphas whose post-submit snapshot is due."""
+    init()
+    since = time.time() - float(since_s)
+    due = time.time() - float(min_interval_s)
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT a.id,a.code,a.metrics,a.submit_status,a.ts FROM alphas a "
+            "WHERE a.user_id=? AND a.ts>? AND a.metrics LIKE '%wqb_alpha_id%' "
+            "AND (a.submitted=1 OR TRIM(a.submit_status)<>'') "
+            "AND NOT EXISTS (SELECT 1 FROM wqb_snapshots s WHERE s.user_id=a.user_id "
+            "AND s.alpha_id=a.id AND s.kind='post_submit' AND s.observed_at>?) "
+            'ORDER BY a.id DESC LIMIT ?', (user_id, since, due, int(limit) * 3)).fetchall()
+    out, seen = [], set()
+    for row in rows:
+        try:
+            metrics = json.loads(row['metrics'] or '{}')
+        except (TypeError, ValueError):
+            metrics = {}
+        wid = str(metrics.get('wqb_alpha_id') or '')
+        if not wid or wid in seen:
+            continue
+        seen.add(wid)
+        out.append({'alpha_id': int(row['id']), 'wqb_alpha_id': wid,
+                    'code': row['code'] or '', 'metrics': metrics,
+                    'submit_status': row['submit_status'] or '', 'ts': row['ts']})
+        if len(out) >= int(limit):
+            break
+    return out
+
+
+def v2_update_alpha_observation(user_id: int, alpha_id: int, harvested: dict) -> None:
+    """Merge a later WQB harvest into the original alpha without losing raw snapshot."""
+    init()
+    with _DB_LOCK, _connect() as conn:
+        row = conn.execute('SELECT metrics FROM alphas WHERE id=? AND user_id=?',
+                           (int(alpha_id), user_id)).fetchone()
+        if row is None:
+            return
+        try:
+            metrics = json.loads(row['metrics'] or '{}')
+        except (TypeError, ValueError):
+            metrics = {}
+        metrics.update(dict((harvested or {}).get('metrics') or {}))
+        status = dict((harvested or {}).get('is_status') or {})
+        passes = list(status.get('pass') or [])
+        fails = list(status.get('fail') or [])
+        errors = list(status.get('error') or [])
+        pending = list(status.get('pending') or [])
+        conn.execute(
+            'UPDATE alphas SET metrics=?, pass_count=?,pass_items=?,fail_count=?,fail_items=?,'
+            'error_count=?,pending_count=?,self_corr=?,sharpe=?,fitness=?,turnover=?,'
+            'drawdown=?,margin=?,returns=? WHERE id=? AND user_id=?',
+            (json.dumps(metrics, ensure_ascii=False), len(passes),
+             json.dumps([str(x.get('name') or '?') for x in passes], ensure_ascii=False),
+             len(fails), json.dumps([str(x.get('name') or '?') for x in fails], ensure_ascii=False),
+             len(errors), len(pending),
+             _coerce_float_or_none(metrics.get('self_correlation')),
+             _coerce_float_or_none(metrics.get('sharpe')),
+             _coerce_float_or_none(metrics.get('fitness')),
+             _coerce_float_or_none(metrics.get('turnover')),
+             _coerce_float_or_none(metrics.get('drawdown')),
+             _coerce_float_or_none(metrics.get('margin')),
+             _coerce_float_or_none(metrics.get('returns')),
+             int(alpha_id), user_id))
+
+
+def v2_activate_policy(user_id: int, version: str, config: dict) -> None:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        conn.execute('UPDATE policy_versions SET active=0 WHERE user_id=?', (user_id,))
+        conn.execute(
+            'INSERT INTO policy_versions (user_id,version,config,active,created_at) '
+            'VALUES (?,?,?,?,?) ON CONFLICT(user_id,version) DO UPDATE SET '
+            'config=excluded.config,active=1',
+            (user_id, str(version), json.dumps(dict(config or {}), ensure_ascii=False),
+             1, time.time()))
+
+
+def v2_summary(user_id: int, since_ts: float) -> dict[str, Any]:
+    init()
+    with _DB_LOCK, _connect() as conn:
+        exp = conn.execute(
+            'SELECT COUNT(*) n, COUNT(DISTINCT canonical_id) u, '
+            "SUM(CASE WHEN state='REJECTED' THEN 1 ELSE 0 END) rejected "
+            'FROM alpha_experiments WHERE user_id=? AND created_at>=?',
+            (user_id, float(since_ts))).fetchone()
+        snaps = conn.execute(
+            'SELECT COUNT(*) FROM wqb_snapshots WHERE user_id=? AND observed_at>=?',
+            (user_id, float(since_ts))).fetchone()[0]
+        cards = conn.execute(
+            'SELECT COUNT(*) FROM evidence_cards WHERE user_id=? AND created_at>=?',
+            (user_id, float(since_ts))).fetchone()[0]
+    return {'experiments': int(exp['n'] or 0), 'unique_canonical': int(exp['u'] or 0),
+            'rejected_preflight': int(exp['rejected'] or 0),
+            'snapshots': int(snaps or 0), 'evidence_cards': int(cards or 0)}
+
+
+def v2_lineage_submitted_today(user_id: int, code: str) -> bool:
+    """True when today's successful portfolio already contains this structural lineage."""
+    if not code:
+        return False
+    init()
+    start = day_start_ts()
+    with _DB_LOCK, _connect() as conn:
+        rows = conn.execute(
+            'SELECT code FROM alphas WHERE user_id=? AND submitted=1 AND ts>=?',
+            (user_id, start)).fetchall()
+    try:
+        from . import research_v2
+        target = research_v2.lineage_profile(code).get('lineage_key')
+        return any(research_v2.lineage_profile(r['code'] or '').get('lineage_key') == target
+                   for r in rows)
+    except Exception:
+        return False

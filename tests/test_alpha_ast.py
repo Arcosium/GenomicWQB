@@ -437,3 +437,15 @@ class TestLintIntegration(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_pp_operator_count_matches_wqb_passes():
+    """PP 한도(≤8, ts_backfill 제외) — 9/18·9/19 실제 통과작이 정확히 8 이다."""
+    from server.alpha_ast import pp_operator_count as c
+    assert c('hump(rank(-1*(ts_corr(ts_rank(winsorize(ts_backfill(volume, 120), std=4),20),'
+             'ts_zscore(winsorize(ts_backfill(mean_high_price_60m_pre_close_2, 120), std=4),60),60))),'
+             'hump=0.03)') == 8
+    assert c('hump(rank(ts_mean(-1*(ts_corr(ts_mean(vec_avg(anl69_best_eps_chg_pct),60),'
+             'ts_zscore(anl69_nav_expected_report_time,3),3)),8)),hump=0.03)') == 8
+    assert c('rank(mdl264_1l_rw)') == 1
+    assert c('(a>=1?b:0)') == 2            # '>=' 하나 + 삼항 하나

@@ -53,6 +53,19 @@ SEED_TEMPLATES: list[dict] = [
      "expr": "min(rank(ts_decay_linear((rank(open) + rank(low)) - (rank(high) + rank(close)), 8)), ts_rank(ts_decay_linear(ts_corr(ts_rank(close, 8), ts_rank(adv60, 21), 8), 7), 3))",
      "ops": ["min", "rank", "ts_decay_linear", "ts_rank", "ts_corr"],
      "intuition": "모든 항이 경계화/decay → 매끄럽고 가중치 분산 양호"},
+    # ── 검증된 고-Sharpe 구조 데모 (필드위생 winsorize(ts_backfill) 은 시스템이 자동 적용) ──
+    {"family": "fundamental_corr_skeleton",
+     "expr": "-1 * rank(ts_decay_linear(ts_corr(group_neutralize(operating_income, sector), assets, 5), 8))",
+     "ops": ["rank", "ts_decay_linear", "ts_corr", "group_neutralize"],
+     "intuition": "검증된 스켈레톤: 섹터중립 펀더멘털 상관 reversion (Kakushadze 101 골격)"},
+    {"family": "two_factor_value_momentum",
+     "expr": "rank(cashflow_op / (cap + 0.000001)) * rank(ts_delta(close, 20))",
+     "ops": ["rank", "ts_delta"],
+     "intuition": "2팩터(현금흐름수익률×가격모멘텀) 각각 rank 후 결합 — 단일팩터 천장 탈출"},
+    {"family": "analyst_zscore_reversion",
+     "expr": "-1 * ts_zscore(anl4_bvps_mean, 63)",
+     "ops": ["ts_zscore"],
+     "intuition": "애널리스트 BVPS 63일 zscore 역전 (jglazar 류 Sharpe~2.0)"},
 ]
 
 FAMILIES: list[str] = sorted({t["family"] for t in SEED_TEMPLATES})

@@ -26,7 +26,7 @@ def isolated_db(tmp_path, monkeypatch):
 @pytest.fixture
 def user_and_round(isolated_db):
     """FK 충족을 위한 user + round 행 생성. (uid, round_id, round_num) 반환."""
-    uid = db.upsert_user('testuser@wq.com', 'pw123', 'gemini-key-test')
+    uid = db.upsert_user('testuser@wq.example', 'pw123', 'gemini-key-test')
     round_num = 1
     round_id = db.start_round(uid, round_num)
     return uid, round_id, round_num
@@ -120,7 +120,7 @@ def test_result_cache_lookup_threads_fp(tmp_path, monkeypatch):
     db.init()
 
     from server import result_cache, settings_fp as sf
-    uid = db.upsert_user('rc@wq.com', 'pw', 'k')
+    uid = db.upsert_user('rc@wq.example', 'pw', 'k')
     rid = db.start_round(uid, 1)
     code = 'rank(volume)'
     db.insert_alpha(uid, rid, 1, {'idx': 1, 'code': code, 'pass_count': 5,

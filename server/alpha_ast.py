@@ -39,7 +39,10 @@ _TOK_RX = re.compile(
     r'|(?P<RPAREN>\))'
     r'|(?P<COMMA>,)'
     r'|(?P<SEMI>;)'
-    r'|(?P<OP>[+\-*/^<>=&|!%])'
+    # '?' 와 ':' 는 FASTEXPR 삼항연산자(cond ? a : b). 여기 없으면 토크나이저가 그 두
+    # 문자를 **조용히 버려서** `x>1?a:b` 가 [x,1,a,b] 로 납작해진다 — 파스 트리가 원식과
+    # 달라진다(2026-07-14, regime 유전자 도입으로 삼항이 정식 산출물이 되며 발견).
+    r'|(?P<OP>[+\-*/^<>=&|!%?:])'
     r'|(?P<WS>\s+)'               # whitespace — consumed but not emitted
 )
 
@@ -274,9 +277,34 @@ def operators_used(code: str) -> set:
         return set()
 
 
+def call_arities(code: str) -> list:
+    """Return [(op_name, arg_count), ...] for every function-call node.
+    arg_count = number of top-level args to that call. Tolerant: [] on failure.
+    #2 프리플라이트 arity 검증(operator_catalog.arity 와 대조)용."""
+    try:
+        tree = parse(code)
+        if tree is None:
+            return []
+        out = []
+        for node in _walk(tree):
+            if isinstance(node, dict) and node.get('type') == 'call':
+                out.append((node.get('name'), len(node.get('args') or [])))
+        return out
+    except Exception:
+        return []
+
+
 def fields_used(code: str) -> set:
     """Return set of NAME tokens used as operands that are NOT operators and
-    whose name has length >= 2. Tolerant: returns {} on failure."""
+    whose name has length >= 2. Tolerant: returns {} on failure.
+
+    명명인자 키(`std=4`, `filter=True`, `hump=0.03`)와 그룹명(`sector` 등)은
+    **데이터필드가 아니다**. 파서는 `std=4` 를 name('std') + OP('=') + number 로
+    쪼개므로 그대로 두면 'std' 가 필드로 잡히고, presim_gate 의 팔레트 검사가
+    "unknown datafield: std" 로 알파를 통째로 드롭한다. 이 제외 규칙은 원래
+    apply_field_hygiene 에만 있었는데(=아래 _HYGIENE_* 상수), 필드 추출 자체의
+    성질이므로 여기로 내린다 — 두 호출자가 같은 진실을 쓴다.
+    """
     try:
         from . import operator_catalog
     except ImportError:
@@ -288,15 +316,42 @@ def fields_used(code: str) -> set:
         tree = parse(code)
         if tree is None:
             return set()
+        exclude = (set(_HYGIENE_ASSIGN_RX.findall(code))
+                   | _HYGIENE_GROUP_NAMES | _HYGIENE_LITERALS)
         result: set[str] = set()
         for node in _walk(tree):
             if node.get('type') == 'name':
                 n = node['value']
-                if len(n) >= 2 and not operator_catalog.is_operator(n):
+                if len(n) >= 2 and n not in exclude \
+                        and not operator_catalog.is_operator(n):
                     result.add(n)
         return result
     except Exception:
         return set()
+
+
+_PP_FREE_CALLS = frozenset({'ts_backfill', 'group_backfill'})
+
+
+def pp_operator_count(code: str) -> int:
+    """Power Pool 규정의 '총 연산자 수' — 함수 호출 + 산술·비교·삼항 연산자.
+
+    규정(2026-09-22 개정 문서): ≤ 8, ts_backfill·group_backfill 은 세지 않는다.
+    단항 마이너스(-1*x 의 '-')·명명인자 '='·삼항의 ':' 는 세지 않고, '<=' 처럼
+    붙은 두 글자 연산자는 하나로 센다. 실측 대조: 9/18·9/19 통과작이 정확히 8.
+    """
+    n, prev = 0, None
+    toks = tokenize(code)
+    for i, t in enumerate(toks):
+        k, v = t['kind'], t['value']
+        if k == 'NAME' and i + 1 < len(toks) and toks[i + 1]['kind'] == 'LPAREN':
+            n += v.lower() not in _PP_FREE_CALLS
+        elif k == 'OP' and v not in '=:':
+            unary = v == '-' and (prev is None or prev['kind'] in ('LPAREN', 'COMMA', 'SEMI', 'OP'))
+            glued = prev is not None and prev['kind'] == 'OP' and prev['value'] not in '=:'
+            n += not (unary or glued)
+        prev = t
+    return n
 
 
 def max_depth(code: str) -> int:
@@ -550,3 +605,38 @@ def structural_overlap(code, others):
         return best, best_i
     except Exception:
         return 0, -1
+
+
+# ---------------------------------------------------------------------------
+# Field hygiene — deterministic winsorize(ts_backfill(F,120),std=4) auto-wrap
+# ---------------------------------------------------------------------------
+# LLM 비순응 보완(참조: worldquant-miner machine_lib.process_datafields): base 데이터필드를
+# 코드 레벨에서 결정론적으로 위생 래핑해 Sharpe~0.2(결측갭+이상치 횡단면 지배)를 차단한다.
+_HYGIENE_GROUP_NAMES = {'sector', 'industry', 'subindustry', 'market', 'country'}
+_HYGIENE_LITERALS = {'true', 'false', 'nan'}
+_HYGIENE_ASSIGN_RX = re.compile(r'(\w+)\s*=(?!=)')   # sig_a= , std= , filter=  (== 은 제외)
+
+
+def apply_field_hygiene(code: str, *, backfill: int = 120, std: int = 4) -> str:
+    """base 데이터필드를 winsorize(ts_backfill(F, backfill), std=std) 로 자동 래핑.
+
+    제외: sig_ 중간변수·named-arg key(X=...)·group 명(sector 등)·리터럴·이미 ts_backfill 로
+    감싼 필드. vec_ 벡터 알파는 그대로 둔다(vec_* 별도 처리 필요). 절대 raise 안 함."""
+    try:
+        if not code or 'vec_' in code:
+            return code
+        fields = fields_used(code)
+        if not fields:
+            return code
+        assigned = set(_HYGIENE_ASSIGN_RX.findall(code))
+        exclude = assigned | _HYGIENE_GROUP_NAMES | _HYGIENE_LITERALS
+        # 긴 이름부터 — 짧은 필드가 긴 필드의 부분문자열일 때 오치환 방지
+        targets = sorted((f for f in fields if f not in exclude), key=len, reverse=True)
+        for f in targets:
+            wrapped = f'winsorize(ts_backfill({f}, {backfill}), std={std})'
+            # 단어경계 + 이미 ts_backfill( 안에 있는 필드는 건너뛴다(멱등)
+            pat = r'(?<!ts_backfill\()(?<!\w)' + re.escape(f) + r'(?!\w)'
+            code = re.sub(pat, wrapped, code)
+        return code
+    except Exception:
+        return code
