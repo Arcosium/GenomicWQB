@@ -1312,7 +1312,10 @@ class Worker(threading.Thread):
         # 이번 라운드가 죽은 부모로 시작하지 않는다.
         try:
             _spec_now = run_config.get_constraint()
-            _reg_now = str(getattr(_spec_now, 'region', '') or '').upper()
+            # 조건이 있는데 리전이 없으면(10월 All regions 테마) 생성기가 기본 리전 USA 로
+            # 돈다 — 옛 GLB 부모 큐를 그대로 두면 필드 부재로 sub-round 가 전멸한다.
+            _reg_now = (str(getattr(_spec_now, 'region', '') or '').upper()
+                        or ('USA' if _spec_now is not None else ''))
             if _reg_now and _reg_now != run_config.get_last_region():
                 _oldq = _db.get_focus_queue(self.user_id)
                 if _oldq:

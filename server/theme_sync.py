@@ -44,6 +44,12 @@ def _norm(text) -> str:
     return ' '.join(str(text or '').split())
 
 
+def _is_theme_line(ln: str) -> bool:
+    """테마행인가. 10월 문서부터 'region=' 이 없고 'delay=' 로 시작한다
+    (All regions/D1 Power Pool Oct`26 — 지역·유니버스 무제한)."""
+    return 'region=' in ln or 'delay=' in ln
+
+
 def monday_of(d: _dt.date) -> _dt.date:
     return d - _dt.timedelta(days=d.weekday())
 
@@ -52,7 +58,7 @@ def parse_week_themes(text: str, now_utc=None) -> list[tuple]:
     """문서 텍스트 → [(월요일 date, 테마 문자열)] (주 순서대로).
 
     형식(실측): 월 헤딩("July") → 요일 헤더 → 날짜행("27 29 29 30 31 1 August 2")
-    → 빈 줄 → 'region=' 로 시작하는 테마행. 날짜행 첫 숫자 = 그 주 월요일 일자.
+    → 빈 줄 → 'region=' (10월부터는 'delay=') 이 든 테마행. 날짜행 첫 숫자 = 그 주 월요일 일자.
     날짜행엔 오타가 실재하므로(7월 문서의 '29 29'), 요일 검증이 되는 행 하나를
     앵커로 잡고 나머지는 ±7일 산술로 만든다.
     """
@@ -70,10 +76,10 @@ def parse_week_themes(text: str, now_utc=None) -> list[tuple]:
     pending_day = None
     for ln in lines:
         m = re.match(r'^(\d{1,2})\b', ln)
-        if m and 'region=' not in ln:
+        if m and not _is_theme_line(ln):
             pending_day = int(m.group(1))
             continue
-        if 'region=' in ln:
+        if _is_theme_line(ln):
             rows.append((pending_day, _norm(ln)))
             pending_day = None
     if not rows:
@@ -153,7 +159,7 @@ def fetch_article_text(username: str, password: str) -> str | None:
                         timeout=10000)
                 except Exception:
                     body = pg.inner_text('body')
-                if 'region=' not in body:
+                if not _is_theme_line(body):
                     LOG.warning('theme fetch — 본문에 테마 없음 (url=%s)', pg.url)
                     return None
                 return body

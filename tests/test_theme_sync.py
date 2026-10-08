@@ -88,3 +88,74 @@ def test_manual_scope_override_is_not_replaced():
     current = 'region=USA & delay=1 & universe=TOP1000'
     new = 'region=GLB & delay=1 & universe=TOPDIV3000'
     assert theme_sync._merge_manual_overlay(current, old, new) is None
+
+
+# 2026-10-08 실측 스크랩 (10월 문서 — region= 없이 delay= 로 시작, 날짜행은 2행부터 요일과 어긋남)
+OCT_ARTICLE = """Current month Power Pool Themes
+October
+Mo\tTu\tWe\tTh\tFr\tSa\tSu
+28 Sept\t29 Sept\t30 Sept\t1 Oct\t2\t3\t4
+
+
+D1 Power Pool Oct`26: delay=1 & datacategory in ['pv', 'fundamnetal'] & single datacategory
+
+
+7\t8\t9\t10\t11\t12\t13
+
+
+D1 Power Pool Oct`26: delay=1 & datacategory in ['pv', 'fundamnetal'] & single datacategory
+
+
+14\t15\t16\t17\t18\t19\t20
+
+
+D1 Power Pool Oct`26: delay=1 & datacategory in ['analyst', 'model', 'news'] & single datacategory
+
+
+21\t22\t23\t24\t25\t26\t27
+
+
+D1 Power Pool Oct`26: delay=1 & datacategory in ['analyst', 'model', 'news'] & single datacategory
+
+
+28\t29\t30\t \t \t \t 
+"""
+
+
+def _utc(m, d):
+    return dt.datetime(2026, m, d, 12, 0, tzinfo=dt.timezone.utc)
+
+
+def test_october_region_less_rows_are_themes():
+    weeks = theme_sync.parse_week_themes(OCT_ARTICLE, now_utc=_utc(10, 8))
+    assert [w[0] for w in weeks] == [
+        dt.date(2026, 9, 28), dt.date(2026, 10, 5), dt.date(2026, 10, 12), dt.date(2026, 10, 19)]
+    assert theme_sync._is_theme_line('region=GLB & delay=1')
+    assert not theme_sync._is_theme_line('28 Sept\t29 Sept')
+
+
+def test_october_current_theme_follows_the_week():
+    assert "['pv', 'fundamnetal']" in theme_sync.current_theme(OCT_ARTICLE, now_utc=_utc(10, 8))
+    assert "['pv', 'fundamnetal']" in theme_sync.current_theme(OCT_ARTICLE, now_utc=_utc(10, 11))
+    assert "['analyst', 'model', 'news']" in theme_sync.current_theme(OCT_ARTICLE, now_utc=_utc(10, 12))
+    assert theme_sync.current_theme(OCT_ARTICLE, now_utc=_utc(10, 27)) is None   # 문서에 없는 주
+
+
+def test_october_theme_keeps_manual_dataset_overlay_and_drops_scope():
+    aug = ("GLB/D1 Liquid Power Pool Aug`26: region=GLB & delay=1 & universe=TOPDIV3000 & "
+           "datasets not in ['model110']")
+    cur = aug + " & datasets not in ['institutions18', 'tech_chart_model']"
+    new = theme_sync.current_theme(OCT_ARTICLE, now_utc=_utc(10, 8))
+    merged = theme_sync._merge_manual_overlay(cur, aug, new)
+    spec = constraint_spec.parse(merged)
+    assert spec.region is None and spec.universe is None and spec.delay == '1'
+    assert spec.excluded_datasets == {'institutions18', 'tech_chart_model'}
+    assert spec.categories and not spec.unparsed
+
+
+def test_region_less_theme_admits_any_region_but_not_banned_datasets():
+    spec = constraint_spec.parse(theme_sync.current_theme(OCT_ARTICLE, now_utc=_utc(10, 8)))
+    for st in ({'region': 'USA', 'delay': 1, 'universe': 'TOP1000'},
+               {'region': 'GLB', 'delay': 1, 'universe': 'TOPDIV3000'}):
+        assert spec.compliant(settings=st, datasets=[], checks={})[0]
+    assert not spec.compliant(settings={'region': 'USA', 'delay': 0}, datasets=[], checks={})[0]

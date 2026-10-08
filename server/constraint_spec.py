@@ -103,6 +103,10 @@ class ConstraintSpec:
     neutralizations: tuple = ()          # 빈 튜플이면 제약 없음
     excluded_datasets: frozenset = frozenset()
     required_checks: tuple = ()
+    # 주간 테마의 데이터 카테고리 절 원문(예: "datacategory in ['pv', 'fundamnetal']").
+    # ponytail: 기록·표시만 한다 — 보상(배수·대회) 조건이라 제출을 막지 않고, 필드→카테고리
+    # 매핑이 없어 생성도 못 가둔다. 매핑이 생기면 compliant()/_constrain 에서 강제한다.
+    categories: tuple = ()
     unparsed: tuple = ()
 
     def is_empty(self) -> bool:
@@ -169,6 +173,8 @@ class ConstraintSpec:
             bits.append('제외 ' + ','.join(sorted(self.excluded_datasets)))
         if self.required_checks:
             bits.append('요구 ' + ','.join(self.required_checks))
+        if self.categories:
+            bits.append('카테고리(참고) ' + ' / '.join(self.categories))
         return ' · '.join(bits) if bits else '(제약 없음)'
 
     def required_check_state(self, *, checks=None, metrics=None) -> str:
@@ -378,10 +384,15 @@ def parse(text, label: str = '') -> ConstraintSpec:
     if not raw:
         return spec
 
-    neuts, excluded, checks, unparsed = [], set(), [], []
+    neuts, excluded, checks, categories, unparsed = [], set(), [], [], []
     for p in _split_clauses(raw):
         c = p.strip().rstrip(',').strip()
+        # 테마 이름표("D1 Power Pool Oct`26: delay=1")는 떼고 key=value 만 본다.
+        c = re.sub(r'^[^=:]*:\s*(?=[A-Za-z]+\s*=)', '', c)
         if not c:
+            continue
+        if re.search(r'\bdatacategory\b', c, re.I):
+            categories.append(c)
             continue
         m = re.match(r'region\s*[=:]\s*([A-Za-z]+)', c, re.I)
         if m:
@@ -422,6 +433,7 @@ def parse(text, label: str = '') -> ConstraintSpec:
     spec.neutralizations = tuple(dict.fromkeys(neuts))
     spec.excluded_datasets = frozenset(excluded)
     spec.required_checks = tuple(dict.fromkeys(checks))
+    spec.categories = tuple(dict.fromkeys(categories))
     spec.unparsed = tuple(still)
     return spec
 
