@@ -576,13 +576,13 @@ def _build_user_prompt_full(round_num: int, feedback: list[dict],
     if not datafields:
         datafields = _read_csv_text(DATAFIELDS_CSV)
     parts = [
-        f"라운드 #{round_num} — 8개 알파를 새로 생성하라.",
-        "",
         "===== brain_operators.csv =====",
         operators,
         "",
         "===== IQC_brain_datafields.csv =====",
         datafields,
+        "",
+        f"라운드 #{round_num} — 8개 알파를 새로 생성하라.",
         "",
         *_common_sections(round_num, feedback, errors, avoid_codes,
                           submitted_codes, seeds, pref_stats),

@@ -3,12 +3,15 @@
 Gemini(google-genai) 호출을 로컬 Ollama(OpenAI 호환 /v1/chat/completions)로 돌린다.
 gemini_strategist.py / auth.py 의 import 두 줄만 이 모듈로 바꾸면:
   - genai.Client(...).models.generate_content(model, contents, config) → 로컬 모델 호출
-  - prompt cache(client.caches.create) → NotImplementedError → 호출자가 비캐시 경로로 폴백
+  - prompt cache(client.caches.create) → 안정된 system·카탈로그 접두부 → SGLang KV 캐시 재사용
   - Google Search grounding(tools=...) / response_schema / ThinkingConfig → 무해한 no-op
 모델명(gemini-*)은 무시하고 항상 LOCAL_LLM_MODEL 을 쓴다. JSON 산출은 프롬프트가 이미
 "JSON 배열만" 을 강제하고 호출부 _parse_strategies 가 코드펜스/[...] 추출을 처리한다.
 """
 import os
+import hashlib
+import threading
+import time
 
 import requests
 
@@ -23,15 +26,37 @@ class _Resp:
         self.text = text or ''
 
 
+_CACHE = {}
+_CACHE_LOCK = threading.RLock()
+
+
+def _content_text(contents):
+    if isinstance(contents, str): return contents
+    if not isinstance(contents, list): return str(contents)
+    return '\n\n'.join(str(getattr(part, 'text', '')) for content in contents for part in getattr(content, 'parts', []))
+
+
 class _Models:
     def generate_content(self, *, model=None, contents='', config=None):
         system = getattr(config, 'system_instruction', None) if config is not None else None
         temperature = getattr(config, 'temperature', 0.9) if config is not None else 0.9
         max_tokens = getattr(config, 'max_output_tokens', 4096) if config is not None else 4096
         messages = []
+        name = getattr(config, 'cached_content', None) if config is not None else None
+        cached = None
+        if name:
+            with _CACHE_LOCK:
+                cached = _CACHE.get(name)
+            if cached is None or cached['expires'] < time.monotonic():
+                raise ValueError('cached_content expired; regenerate cache')
+            if system and str(system) != cached['system']:
+                raise ValueError('cached_content system mismatch')
+            system = cached['system']
         if system:
             messages.append({'role': 'system', 'content': str(system)})
-        messages.append({'role': 'user', 'content': contents if isinstance(contents, str) else str(contents)})
+        if cached:
+            messages.append({'role': 'user', 'content': cached['content']})
+        messages.append({'role': 'user', 'content': _content_text(contents)})
         body = {
             'model': LOCAL_MODEL,                 # gemini-* 무시, 로컬 모델 고정
             'messages': messages,
@@ -47,16 +72,28 @@ class _Models:
 
 
 class _Caches:
-    def create(self, *a, **k):
-        # 로컬 LLM에는 Google prompt cache API가 없다. None을 반환하면
-        # 호출부가 조용히 비캐시(전체 프롬프트) 경로를 사용한다.
-        return None
+    def __init__(self, namespace):
+        self.namespace = namespace
+
+    def create(self, *, model=None, config=None):
+        system = str(getattr(config, 'system_instruction', '') or '')
+        content = _content_text(getattr(config, 'contents', []))
+        if not content: return None
+        name = 'local-prefix-' + hashlib.sha256((self.namespace + '\0' + system + '\0' + content).encode()).hexdigest()
+        ttl = str(getattr(config, 'ttl', '3600s')).rstrip('s')
+        with _CACHE_LOCK:
+            now = time.monotonic()
+            for key in list(_CACHE):
+                if _CACHE[key]['expires'] < now: del _CACHE[key]
+            _CACHE[name] = {'system': system, 'content': content, 'expires': now + min(3600, max(1, int(ttl)))}
+        return _Stub(name=name)
 
 
 class Client:
     def __init__(self, *a, **k):
+        namespace = hashlib.sha256(str(k.get('api_key') or '').encode()).hexdigest()
         self.models = _Models()
-        self.caches = _Caches()
+        self.caches = _Caches(namespace)
 
 
 # ── google.genai.types 드롭인 no-op 스텁 (모듈 로드시 스키마/툴 구성이 깨지지 않게) ──
