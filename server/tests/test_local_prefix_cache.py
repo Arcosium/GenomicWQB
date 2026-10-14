@@ -19,3 +19,14 @@ def test_expired_prefix_never_drops_catalog(monkeypatch):
  client=llm.Client(api_key='test');cached=client.caches.create(config=S(system_instruction='규칙',contents='내용',ttl='1s'))
  llm._CACHE[cached.name]['expires']=0
  with pytest.raises(ValueError,match='expired'):client.models.generate_content(contents='new',config=S(cached_content=cached.name))
+
+
+def test_generated_candidates_disable_reasoning(monkeypatch):
+ sent=[]
+ class R:
+  def raise_for_status(self):pass
+  def json(self):return {'choices':[{'message':{'content':'[]'}}]}
+ monkeypatch.setattr(llm.requests,'post',lambda *a,**k:sent.append(k['json']) or R())
+ llm.Client().models.generate_content(contents='후보 생성',config=S(max_output_tokens=128))
+ assert sent[0]['chat_template_kwargs']=={'enable_thinking':False}
+ assert sent[0]['max_tokens']==128

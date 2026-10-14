@@ -1,6 +1,6 @@
 """HYFE_IQC 로컬 LLM seam — google.genai 드롭인 shim (외부 API 미사용).
 
-Gemini(google-genai) 호출을 로컬 Ollama(OpenAI 호환 /v1/chat/completions)로 돌린다.
+Gemini(google-genai) 호출을 로컬 SGLang(OpenAI 호환 /v1/chat/completions)로 돌린다.
 gemini_strategist.py / auth.py 의 import 두 줄만 이 모듈로 바꾸면:
   - genai.Client(...).models.generate_content(model, contents, config) → 로컬 모델 호출
   - prompt cache(client.caches.create) → 안정된 system·카탈로그 접두부 → SGLang KV 캐시 재사용
@@ -16,7 +16,7 @@ import time
 import requests
 
 LOCAL_BASE_URL = os.environ.get('LOCAL_LLM_BASE_URL', 'http://127.0.0.1:11434/v1').rstrip('/')
-LOCAL_MODEL = os.environ.get('LOCAL_LLM_MODEL', 'qwen3.6-35b-a3b-uncensored')
+LOCAL_MODEL = os.environ.get('LOCAL_LLM_MODEL', 'arc-local')
 _TIMEOUT = int(os.environ.get('LOCAL_LLM_TIMEOUT', '600'))
 
 
@@ -63,6 +63,8 @@ class _Models:
             'temperature': float(temperature) if temperature is not None else 0.9,
             'max_tokens': int(max_tokens) if max_tokens else 4096,
             'stream': False,
+            'chat_template_kwargs': {'enable_thinking': False},
+            'top_p': 0.8, 'top_k': 20,
         }
         r = requests.post(LOCAL_BASE_URL + '/chat/completions', json=body, timeout=_TIMEOUT)
         r.raise_for_status()

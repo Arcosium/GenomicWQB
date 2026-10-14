@@ -3,10 +3,8 @@
 계약: 근거 블록([출처N])을 받아 가설 N개를 낸다. 각 가설은 반드시 인용번호를 갖는다 —
 근거 없이 지어낸 가설을 사후에 걸러내기 위해서다(ArkInsight 의 사실성 가드와 같은 원리).
 
-LLM 은 lib/arcllm 을 쓴다. server/local_llm.py 를 쓰지 않는 이유:
-  로컬 Qwen3.6 은 **추론 모델**이라 max_tokens 가 작으면 thinking 만 뱉고 content 가
-  빈 문자열로 온다. arcllm 은 기본 24000 + 빈응답 재시도가 들어 있고, local_llm 은
-  기본 4096 에 재시도가 없다 (= 조용한 빈 응답).
+LLM은 lib/arcllm을 쓴다. 가설 판단은 추론을 켜고, 반복적인 수식 작성은 끈다.
+공용 클라이언트가 빈 응답과 일시 오류를 재시도하며 재시도 시간 예산을 관리한다.
 """
 from __future__ import annotations
 
@@ -62,13 +60,9 @@ def _llm(messages: list[dict], *, max_tokens: int = 24000,
         LOG.warning('arcllm 미설치 — 아이디어 생성 건너뜀')
         return ''
     try:
-        if think:
-            return arcllm.chat(messages, max_tokens=max_tokens,
-                               temperature=temperature,
-                               timeout=int(timeout or LLM_TIMEOUT_S))
-        return _chat_no_think(messages, max_tokens=max_tokens,
-                              temperature=temperature,
-                              timeout=int(timeout or LLM_TIMEOUT_S))
+        return arcllm.chat(messages, max_tokens=max_tokens,
+                           temperature=temperature, think=think,
+                           timeout=int(timeout or LLM_TIMEOUT_S))
     except Exception as e:
         LOG.warning('LLM 호출 실패: %s: %s', type(e).__name__, e)
         return ''
@@ -76,23 +70,10 @@ def _llm(messages: list[dict], *, max_tokens: int = 24000,
 
 def _chat_no_think(messages: list[dict], *, max_tokens: int, temperature: float,
                    timeout: int) -> str:
-    """추론 OFF 호출 — arcllm 이 이 노브를 노출하지 않아 여기서 직접 POST 한다."""
-    import json as _json
-    import os as _os
-    import urllib.request as _u
-    base = (_os.environ.get('LOCAL_LLM_BASE_URL')
-            or 'http://127.0.0.1:11434/v1').rstrip('/')
-    model = _os.environ.get('LOCAL_LLM_MODEL', 'qwen3.6-35b-a3b-uncensored')
-    body = _json.dumps({
-        'model': model, 'messages': messages, 'stream': False,
-        'temperature': temperature, 'max_tokens': max_tokens,
-        'chat_template_kwargs': {'enable_thinking': False},
-    }).encode()
-    req = _u.Request(base + '/chat/completions', data=body,
-                     headers={'Content-Type': 'application/json'})
-    with _u.urlopen(req, timeout=timeout) as r:
-        data = _json.loads(r.read())
-    return ((data.get('choices') or [{}])[0].get('message') or {}).get('content', '') or ''
+    """기존 호출부 호환용 추론 OFF 래퍼."""
+    import arcllm
+    return arcllm.chat(messages, max_tokens=max_tokens, temperature=temperature,
+                       timeout=timeout, think=False)
 
 
 _FENCE_RX = re.compile(r'^\s*```(?:json)?\s*|\s*```\s*$', re.MULTILINE)
