@@ -3116,6 +3116,16 @@ def submitted_metrics_since(conn, user_id: int, since_ts: float) -> list[str]:
 
 
 @_with_conn
+def submitted_codes_since(conn, user_id: int, since_ts: float) -> list[str]:
+    """since_ts 이후 **제출 시각** 기준으로 성사된 코드. alphas 쪽(submitted_metrics_since)은
+    생성 시각 기준인 데다 submitted 표시가 빠진 행도 있어 2026-10 제출 47건 중 29건만 잡힌다
+    (7건은 지난 분기 생성, 11건은 표시 누락)."""
+    return [r[0] or '' for r in conn.execute(
+        'SELECT code FROM submit_attempts WHERE user_id=? AND submitted=1 AND ts>=?',
+        (user_id, since_ts))]
+
+
+@_with_conn
 def code_pyramid_pairs(conn) -> list[tuple]:
     """(code, pyramids) 쌍 — 데이터셋→피라미드 카테고리 사상을 실측으로 학습한다.
     제출 여부와 무관하다. 체크를 받아 본 알파면 WQB 가 칸을 이미 알려줬다."""

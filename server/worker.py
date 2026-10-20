@@ -132,6 +132,34 @@ def _metric_float(row: dict, key: str) -> float:
         return float('-inf')
 
 
+# '좋은 알파' margin 하한 — WQB 한국 중급 스프린트 과제 3 기준(ASI·KOR·HKG·TWN 15bps, 그 외 10bps).
+_GOOD_MARGIN = {'ASI': 0.0015, 'KOR': 0.0015, 'HKG': 0.0015, 'TWN': 0.0015}
+_GOOD_MARGIN_DEFAULT = 0.0010
+
+
+def _drain_key(row: dict, seen_fields: set) -> tuple:
+    """드레인 순서 — ① 이번 분기 제출작에 없던 필드를 쓰나 ② margin 하한·단일 데이터셋인가 ③ 샤프.
+
+    샤프순만 쓰면 하루 4칸을 같은 계보의 고샤프 변주가 차지한다. 2026-10 실측: 제출 47건 중
+    sweep 27건, anl69_best_pe_ratio 한 필드가 15건 — Genius 타이브레이커 '총 고유 필드 수'
+    하위권. 신선 후보가 없는 날은 그대로 샤프순이라 하루 제출 리듬은 안 깨진다. 동률은 오래된 것부터.
+    """
+    code = str(row.get('code') or '')
+    fresh = bool(_alpha_ast.fields_used(code) - seen_fields)
+    region = str((row.get('metrics') or {}).get('region') or '').upper()
+    good = (_metric_float(row, 'margin') >= _GOOD_MARGIN.get(region, _GOOD_MARGIN_DEFAULT)
+            and len(_datasets_used_by_code(code)) == 1)
+    return (fresh, good, _metric_float(row, 'sharpe'), -int(row['id']))
+
+
+def _quarter_submitted_fields(user_id: int) -> set:
+    from .pyramids import quarter_start
+    seen: set = set()
+    for c in _db.submitted_codes_since(user_id, quarter_start()):
+        seen |= _alpha_ast.fields_used(c)
+    return seen
+
+
 def _datasets_used_by_code(code: str) -> set[str]:
     """로컬 필드 카탈로그로 확인 가능한 dataset.id 집합.
 
@@ -869,9 +897,9 @@ class Worker(threading.Thread):
                              and float(r.get('updated_at') or 0) >= _d0)]
             if not rows:
                 return None
-            # 샤프 높은 것부터 (2026-09-23) — 오래된 순이면 13:00 에 열리는 4칸을 먼저 들어온
-            # 약한 알파가 차지한다. 동률은 오래된 것부터.
-            row = max(rows, key=lambda r: (_metric_float(r, 'sharpe'), -int(r['id'])))
+            # 신선 필드 → 좋은 알파 → 샤프 순 (2026-10-20, 이전엔 샤프순만) — _drain_key 참고.
+            _seen = _quarter_submitted_fields(self.user_id)
+            row = max(rows, key=lambda r: _drain_key(r, _seen))
             if self._submitted_today() >= DAILY_SUBMIT_BUDGET:
                 return None
         except Exception:

@@ -75,7 +75,8 @@ def run(client, specs, *, workers: int = 8, deadline_s: int = 1400,
             sub = _criteria.submittability(m)
             rec = {'tag': tag, 'alpha': aid, 'expr': expr,
                    'sharpe': m.get('sharpe'), 'fitness': m.get('fitness'),
-                   'turnover': m.get('turnover'), 'gates': gates,
+                   'turnover': m.get('turnover'), 'margin': m.get('margin'),
+                   'gates': gates,
                    'binding': bname, 'binding_progress': bval,
                    'submittability': sub, 'ready': sub >= 1.0}
             with lock:
