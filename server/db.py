@@ -900,6 +900,28 @@ def day_start_ts(now: float | None = None) -> float:
     return local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
+def month_start_ts(now: float | None = None) -> float:
+    """플랫폼 달력의 이번 달 1일 0시(America/New_York) — 순수 PP 월 한도의 리셋 경계."""
+    import datetime as _dt
+    ts = time.time() if now is None else float(now)
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo('America/New_York')
+    except Exception:
+        tz = _dt.timezone(_dt.timedelta(hours=-4))
+    local = _dt.datetime.fromtimestamp(ts, tz)
+    return local.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+@_with_conn
+def pp_monthly_quota_hit_since(conn, user_id: int, since_ts: float) -> bool:
+    """since_ts 이후 WQB 가 `POWER_POOL_MONTHLY_SUBMISSION` 으로 거절한 적이 있나."""
+    return conn.execute(
+        "SELECT 1 FROM submit_attempts WHERE user_id=? AND ts>=? "
+        "AND submit_status LIKE '%POWER_POOL_MONTHLY_SUBMISSION%' LIMIT 1",
+        (user_id, since_ts)).fetchone() is not None
+
+
 def platform_date(now: float | None = None) -> str:
     """WQB 가 쓰는 '오늘' 날짜 문자열(YYYY-MM-DD, America/New_York).
 

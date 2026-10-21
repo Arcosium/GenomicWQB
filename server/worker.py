@@ -152,6 +152,23 @@ def _drain_key(row: dict, seen_fields: set) -> tuple:
     return (fresh, good, _metric_float(row, 'sharpe'), -int(row['id']))
 
 
+_PP_CLOSED_CACHE: dict = {}     # user_id → (조회 시각, 결과)
+
+
+def _pp_month_closed(user_id: int, now: float | None = None) -> bool:
+    """이번 달(동부시간) 순수 PP 월 한도 거절을 받았나. 드레인이 행마다 부르므로 10분 캐시."""
+    t = time.time() if now is None else float(now)
+    hit = _PP_CLOSED_CACHE.get(user_id)
+    if hit and t - hit[0] < 600:
+        return hit[1]
+    try:
+        closed = _db.pp_monthly_quota_hit_since(user_id, _db.month_start_ts(t))
+    except Exception:
+        closed = False          # 조회 실패로 제출을 막지 않는다
+    _PP_CLOSED_CACHE[user_id] = (t, closed)
+    return closed
+
+
 def _quarter_submitted_fields(user_id: int) -> set:
     from .pyramids import quarter_start
     seen: set = set()
@@ -525,6 +542,14 @@ class Worker(threading.Thread):
             _sh = None
         if _sh is not None and _sh < MIN_SUBMIT_SHARPE:
             return False, f'below_min_sharpe({_sh:.2f}<{MIN_SUBMIT_SHARPE})'
+        # 🚪 순수 PP 월 한도 소진 — 2026-10-20 부터 `POWER_POOL_MONTHLY_SUBMISSION(17 vs 10)` 이
+        #    나오기 시작했다. 그달엔 PP 완화선(샤프 1.0)으로는 안 나가므로 표준·HT 컷 미달은
+        #    보내지 않는다(거절 한 건이 제출 슬롯을 몇 분씩 붙잡아 그날 시도 370건이 0건).
+        #    다음 달 1일(동부시간)이면 조회 범위가 바뀌어 저절로 풀린다.
+        if _pp_month_closed(self.user_id) and max(
+                _criteria.standard_progress(metrics or {}),
+                _criteria.ht_progress(metrics or {})) < 1.0:
+            return False, 'pp_month_closed(regular_cut_miss)'
         # 같은 식 차단은 **여기서 하나도 하지 않는다** (2026-08-04 사장 지시 "제출은 일단
         # submit 떴으면 해보고", 2026-08-06 재지시). 문 앞에서 막아 봐야 시뮬 슬롯은 이미
         # 태운 뒤라 아끼는 게 없고, 거절은 쿼터를 안 쓴다. 중복은 전부 **시뮬 전**(라운드
