@@ -95,6 +95,9 @@ HT_RESCUE_PER_ROUND = int(os.environ.get('IQC_HT_RESCUE_PER_ROUND', '2'))
 # 충분히 큰데 부호·회전율·Fitness 로만 막힌 알파에 표준 처방(부호반전·사후감쇠·RAM
 # 중립화)을 즉시 건다. 그날 제출권에 든 유일한 알파가 이 처방에서 나왔다. 0 = OFF.
 HUNT_LADDER_PER_ROUND = int(os.environ.get('IQC_HUNT_LADDER_PER_ROUND', '3'))
+# 🌐 GLB qfl 다리 조합 (2026-10-23 사장 지시) — 중급 스프린트에서 일반 관문을 넘긴 방식
+# (glb_legs.py). PP 월 한도가 닫힌 10월에도 일반 컷으로 나갈 후보를 탐색 라운드마다 넣는다.
+GLB_LEGS_PER_ROUND = int(os.environ.get('IQC_GLB_LEGS_PER_ROUND', '2'))
 # 라운드당 유전체 후보 수. **동시 슬롯 수보다 많아야** 빈 슬롯이 안 생긴다
 # (2026-07-27 사장 지시). 스레드 풀은 max_workers=슬롯수 로 돌기 때문에, 후보가 슬롯과
 # 같으면(옛 n=8) 시뮬 하나가 끝나도 집어 갈 다음 후보가 없어 그 슬롯이 라운드 끝까지
@@ -1811,6 +1814,11 @@ class Worker(threading.Thread):
                                   f'에서 결합 후보 {len(_ccands)}개 추가'
                                   + (f' (쓸 수 있는 결합식 {_nc}/{len(combine_layer.COMBINERS)})'
                                      if _ops else ''))
+                if GLB_LEGS_PER_ROUND > 0 and not is_focus and not is_spec_round:
+                    from . import glb_legs
+                    _gcands = glb_legs.candidates(GLB_LEGS_PER_ROUND, rng=_det_rng)
+                    strategies.extend(_gcands)
+                    self._log(round_num, f'  🌐 GLB qfl 다리 조합 {len(_gcands)}개 추가')
                 # 🧭 사냥 사다리 — 부호·회전율·Fitness 로만 막힌 강신호에 표준 처방.
                 if HUNT_LADDER_PER_ROUND > 0 and not is_spec_round:
                     from . import hunt_ladder
@@ -1926,7 +1934,10 @@ class Worker(threading.Thread):
             _lint_kept: list[dict] = []
             for _s in strategies:
                 try:
-                    _fixed, _actions = _alpha_repair.repair(_s['code'], delay=forced_delay)
+                    # GLB 다리 조합은 add(..., filter=true) 가 핵심이라 repair 의 filter= 제거를
+                    # 태우지 않는다(스프린트에서 같은 계정·식으로 수백 건 시뮬 성공).
+                    _fixed, _actions = ((_s['code'], []) if _s.get('origin') == 'glb_legs'
+                                        else _alpha_repair.repair(_s['code'], delay=forced_delay))
                     if _actions:
                         _s['code'] = _fixed
                         self._log_quiet(round_num,
@@ -2070,7 +2081,8 @@ class Worker(threading.Thread):
                     _nf = len(_alpha_ast.fields_used(_s['code']))
                 except Exception:
                     _ops, _nf = 0, 0
-                if _ops > PP_MAX_OPERATORS or _nf > PP_MAX_FIELDS:
+                if (_ops > PP_MAX_OPERATORS or _nf > PP_MAX_FIELDS) \
+                        and _s.get('origin') != 'glb_legs':      # 일반 컷 겨냥 레이어
                     self._log_quiet(round_num, f'⊘ #{_s.get("idx")} PP 한도 초과 드롭 '
                                                f'(연산자 {_ops}·필드 {_nf})')
                     continue
