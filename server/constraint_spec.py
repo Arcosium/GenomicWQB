@@ -211,12 +211,15 @@ class ConstraintSpec:
         return {'pass': 1.20, 'unknown': 0.55, 'fail': 0.25}[
             self.required_check_state(checks=checks, metrics=metrics)]
 
-    def compliant(self, *, settings=None, datasets=None, checks=None) -> tuple:
+    def compliant(self, *, settings=None, datasets=None, checks=None,
+                  ignore_unparsed=False) -> tuple:
         """이 알파가 조건을 통과하는가 → (ok, 사유목록).
 
         settings — 시뮬 설정 dict (region/delay/universe/neutralization)
         datasets — 알파가 쓴 데이터셋 id 목록 (None 이면 '미확인' 으로 불충족)
         checks   — {체크이름: 결과문자열}
+        ignore_unparsed — 못 읽은 절을 사유에서 뺀다. 워커용: 어떤 후보도 그 절을 만족할 수
+          없어 탐색이 통째로 멈추기 때문이다(2026-10-26 사고). 판정은 WQB 에 맡긴다.
         """
         s = {str(k): v for k, v in (settings or {}).items()}
         reasons = []
@@ -241,7 +244,7 @@ class ConstraintSpec:
                 if bad:
                     reasons.append(f"금지 데이터셋 사용: {', '.join(bad)}")
         reasons.extend(self.required_check_reasons(checks=checks))
-        if self.unparsed:
+        if self.unparsed and not ignore_unparsed:
             reasons.extend(f'해석 못 한 조건: {clause}' for clause in self.unparsed)
         return (not reasons), reasons
 
@@ -421,6 +424,12 @@ def parse(text, label: str = '') -> ConstraintSpec:
         if m:
             name = m.group(1).strip().lower()
             checks.append(CHECK_ALIAS.get(name, name.upper().replace(' ', '_')))
+            continue
+        # "AMER Sharpe > 1" (2026-10-26 GLB Nov'26 테마) = WQB 의 LOW_GLB_AMER_SHARPE 체크(문턱 1).
+        # 못 읽었을 땐 모든 후보가 사전 위반이 돼 워커가 5초마다 빈 라운드를 돌았다(지금은 무시).
+        m = re.match(r'(AMER|APAC|EMEA)\s+sharpe\s*(?:>=?|≥)\s*[\d.]+\s*$', c, re.I)
+        if m:
+            checks.append(f'LOW_GLB_{m.group(1).upper()}_SHARPE')
             continue
         unparsed.append(c)
 

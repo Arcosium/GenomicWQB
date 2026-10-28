@@ -263,6 +263,7 @@ def _constraint_gate_reasons(constraint, metrics: dict, code: str = '',
             settings=settings,
             datasets=_datasets_used_by_code(code),
             checks=normalized,
+            ignore_unparsed=True,
         )
         if ok:
             return []
@@ -272,6 +273,11 @@ def _constraint_gate_reasons(constraint, metrics: dict, code: str = '',
         return reasons
     except Exception as exc:
         return [f'활성 조건 평가 오류: {exc}']
+
+
+# 조건이 리전만 정하고 유니버스를 비워 두면 GA 의 USA 유니버스(TOP2000·TOP500…)가 그대로 붙어
+# 시뮬 제출이 통째로 실패한다(2026-10-26 GLB Nov'26 테마 첫 라운드 9개 중 8개). 첫 값이 대체값.
+REGION_UNIVERSES = {'GLB': ('TOP3000', 'MINVOL1M', 'TOPDIV3000')}
 
 
 def _apply_constraint_to_strategies(strategies: list[dict], constraint,
@@ -298,6 +304,10 @@ def _apply_constraint_to_strategies(strategies: list[dict], constraint,
             st['delay'] = str(forced_delay)
         if constraint.universe:
             st['universe'] = constraint.universe
+        else:
+            valid = REGION_UNIVERSES.get(str(st.get('region') or '').upper())
+            if valid and str(st.get('universe') or '').upper() not in valid:
+                st['universe'] = valid[0]
         if allowed_neuts and not constraint.allows_neutralization(st.get('neutralization')):
             idx = max(0, int(strategy.get('idx') or 1) - 1)
             st['neutralization'] = allowed_neuts[idx % len(allowed_neuts)]
@@ -305,8 +315,8 @@ def _apply_constraint_to_strategies(strategies: list[dict], constraint,
 
         genome = strategy.get('genome')
         if isinstance(genome, dict):
-            if constraint.universe:
-                genome['universe'] = constraint.universe
+            if st.get('universe'):
+                genome['universe'] = st['universe']
             if st.get('neutralization'):
                 genome['neutralization'] = st['neutralization']
 
@@ -314,6 +324,7 @@ def _apply_constraint_to_strategies(strategies: list[dict], constraint,
             settings=st,
             datasets=_datasets_used_by_code(strategy.get('code') or ''),
             checks=assumed_checks,
+            ignore_unparsed=True,
         )
         if ok:
             kept.append(strategy)
@@ -1508,7 +1519,8 @@ class Worker(threading.Thread):
             self._log(round_num, f'  탐색 조건 = {_constraint.describe()}')
             if _constraint.unparsed:
                 self._log(round_num,
-                          f'  ⚠ 조건 중 해석 못 한 절: {"; ".join(_constraint.unparsed)}')
+                          f'  ⚠ 조건 중 해석 못 한 절(무시하고 탐색·제출, 판정은 WQB): '
+                          f'{"; ".join(_constraint.unparsed)}')
 
         # 끊긴 제출 회수 (2026-07-23) — 시뮬 전에 가볍게 확인한다 (쿼터 0 소모).
         if account_type == 'research_consultant' and not self._stop_event.is_set():

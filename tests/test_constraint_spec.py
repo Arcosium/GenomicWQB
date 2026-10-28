@@ -241,3 +241,41 @@ def test_best와_yield도_현재_필수체크를_공유한다():
     assert worker._is_best_alpha(result, spec) is False
     result['metrics'][cs.CHECK_RESULTS_METRIC]['THEME_ALPHA'] = 'PASS'
     assert worker._is_best_alpha(result, spec) is True
+
+
+def test_지역_샤프_하한은_GLB_지역_체크로_읽는다():
+    spec = cs.parse("GLB/D1 Power Pool Nov'26: region=GLB & delay=1 & AMER Sharpe > 1 & "
+                    "datasets not in ['global_seasonal_model', 'institutions18']")
+    assert spec.unparsed == ()
+    assert spec.region == 'GLB' and spec.delay == '1'
+    assert spec.required_checks == ('LOW_GLB_AMER_SHARPE',)
+
+
+def test_리전만_정한_조건은_그_리전에_없는_유니버스를_바꾼다():
+    from server import worker
+
+    spec = cs.parse("region=GLB & delay=1 & AMER Sharpe > 1")
+    strategies = [
+        {'idx': 1, 'code': 'rank(close)',
+         'settings': {'region': 'USA', 'delay': '1', 'universe': 'TOP500'},
+         'genome': {'universe': 'TOP500'}},
+        {'idx': 2, 'code': 'rank(close)',
+         'settings': {'region': 'GLB', 'delay': '1', 'universe': 'MINVOL1M'}},
+    ]
+    kept, dropped = worker._apply_constraint_to_strategies(strategies, spec, '1')
+    assert dropped == []
+    assert kept[0]['settings']['universe'] == 'TOP3000' == kept[0]['genome']['universe']
+    assert kept[1]['settings']['universe'] == 'MINVOL1M'
+
+
+def test_못_읽은_절은_워커의_사전판정과_제출판정을_막지_않는다():
+    from server import worker
+
+    spec = cs.parse("region=GLB & delay=1 & Moon Phase is full")
+    assert spec.unparsed
+    assert spec.compliant(settings={'region': 'GLB', 'delay': '1'}, datasets=[])[0] is False
+    kept, dropped = worker._apply_constraint_to_strategies(
+        [{'idx': 1, 'code': 'rank(close)', 'settings': {'universe': 'TOP3000'}}], spec, '1')
+    assert len(kept) == 1 and dropped == []
+    assert worker._constraint_gate_reasons(
+        spec, {'region': 'GLB', 'delay': 1, 'universe': 'TOP3000'}, 'rank(close)') == []
