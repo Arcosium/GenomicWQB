@@ -1183,21 +1183,21 @@ def api_submit_queue_submit():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ⑤ 슈퍼알파 (AAF SuperAlpha 이식) — env 게이트, 자동 제출 없음
+# ⑤ 슈퍼알파 (AAF SuperAlpha 이식) — 워커가 하루 1런, FAIL 0 이면 제출
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/api/superalpha/run', methods=['POST'])
 def api_superalpha_run():
     """OS 알파 풀 위의 슈퍼알파 리서치 1런을 백그라운드로 시작한다.
 
-    게이트: IQC_SUPERALPHA=1 + RC 계정. body(옵션): {seed_plus, n}.
-    결과는 /api/superalpha/runs 로 조회 — 제출은 하지 않는다.
+    게이트: IQC_SUPERALPHA(기본 1, 0 이면 끔) + RC 계정. body(옵션): {seed_plus, n}.
+    결과는 /api/superalpha/runs 로 조회. FAIL 0 인 첫 결과는 런 안에서 바로 제출한다.
     """
     uid, err = _require_user()
     if err:
         return err
-    if os.environ.get('IQC_SUPERALPHA', '0') != '1':
-        return _err('disabled', 'IQC_SUPERALPHA=1 로 켜야 합니다', 403)
+    if os.environ.get('IQC_SUPERALPHA', '1') == '0':
+        return _err('disabled', 'IQC_SUPERALPHA=0 으로 꺼져 있습니다', 403)
     if _db.get_account_type(uid) != 'research_consultant':
         return _err('not_rc', '슈퍼알파는 RC 계정 전용입니다', 403)
     creds = _db.get_user_credentials(uid)

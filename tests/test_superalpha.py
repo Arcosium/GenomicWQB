@@ -18,8 +18,9 @@ def test_selection_expression_embeds_filters_and_seed():
 
 def test_combo_grid_shape():
     g = superalpha.combo_grid()
-    # stats 5종 × ops 3종 + (-drawdown) × 3 = 18
-    assert len(g) == 18
+    # stats 5종 × ops 2종 + (-drawdown) × 2 = 12 — ts_ir 은 WQB 가 모르는 연산자(2026-10-31)
+    assert len(g) == 12
+    assert not any('ts_ir' in c for c in g)
     assert all(c.startswith('stats = generate_stats(alpha);') for c in g)
     # ts 계열엔 창 126, rank 엔 창 없음.
     assert any('ts_rank(stats.pnl,126)' in c for c in g)
@@ -92,3 +93,80 @@ def test_run_stops_immediately_when_account_lacks_permission(isolated_db, monkey
     row = db.superalpha_runs_list(uid)[0]
     assert row['id'] == rid and row['status'] == 'error'
     assert 'super simulation 권한' in (row['error'] or '')
+
+
+# ── FAIL 0 이면 제출 (2026-10-31 권한 확인 뒤) ───────────────────────────────
+
+class _FakeClient:
+    """첫 시뮬 요청은 429, 이후 결과는 FAIL → FAIL 0 → FAIL 0 순서로 돌려준다."""
+
+    def __init__(self):
+        self.sim_calls = 0
+        self.submitted = []
+        self.n = 0
+
+    def authenticate(self):
+        return True
+
+    def submit_super_simulation(self, selection, combo, settings):
+        self.sim_calls += 1
+        return 'RATE_LIMITED' if self.sim_calls == 1 else 'loc'
+
+    def poll(self, loc, stop_event=None):
+        self.n += 1
+        return {'alpha': f'A{self.n}', 'status': 'COMPLETE'}
+
+    def harvest_alpha(self, aid):
+        fail = [{'name': 'HIGH_TURNOVER'}] if aid == 'A1' else []
+        return {'metrics': {'sharpe': 2.7}, 'is_status': {'pass': ['LOW_SHARPE'], 'fail': fail}}
+
+    def set_super_description(self, aid, selection, combo):
+        assert len(selection) >= 100 and len(combo) >= 100, 'WQB 는 100자 미만 설명을 거절한다'
+        self.described = aid
+
+    def submit_alpha(self, aid, stop_event=None, deadline_s=None):
+        assert getattr(self, 'described', None) == aid, '설명 없이 제출했다'
+        self.submitted.append(aid)
+        return True, 'submitted'
+
+
+def test_run_submits_first_clean_result_once(isolated_db, monkeypatch):
+    uid = isolated_db
+    fake = _FakeClient()
+    import server.wqb_api as wqb_api
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+    monkeypatch.setattr(superalpha.time, 'sleep', lambda s: None)
+
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+    assert fake.sim_calls == 4, '429 를 받은 후보를 버렸다'
+    assert fake.submitted == ['A2'], 'FAIL 있는 결과를 냈거나, 성공 뒤에도 또 냈다'
+    res = db.superalpha_runs_list(uid)[0]['results']
+    assert res[1]['submit'] == {'ok': True, 'status': 'submitted'}
+    assert 'submit' not in res[0] and 'submit' not in res[2]
+    # 일반 제출 하루 4건 예산(submit_attempts 집계)을 먹지 않는다.
+    assert db.submitted_today(uid) == 0
+
+
+def test_descriptions_meet_wqb_minimum():
+    assert len(superalpha.SELECTION_DESCRIPTION) >= 100
+    assert all(len(superalpha.combo_description(c)) >= 100 for c in superalpha.combo_grid())
+
+
+def test_run_does_not_submit_in_list_mode_or_without_checks(isolated_db, monkeypatch):
+    uid = isolated_db
+    import server.wqb_api as wqb_api
+    monkeypatch.setattr(superalpha.time, 'sleep', lambda s: None)
+
+    fake = _FakeClient()
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+    db.set_submit_mode(uid, 'list')
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+    assert fake.submitted == [], "제출 방식 '목록'인데 자동 제출했다"
+
+    db.set_submit_mode(uid, 'auto')
+    fake = _FakeClient()
+    fake.harvest_alpha = lambda aid: {'metrics': {}, 'is_status': {
+        'pass': [], 'fail': [], 'error': ['X'], 'pending': [], 'warning': []}}
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=2)
+    assert fake.submitted == [], '판정 불가(PASS 0) 결과를 냈다'

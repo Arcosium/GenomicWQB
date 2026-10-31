@@ -1094,8 +1094,38 @@ class Worker(threading.Thread):
                 u, p = creds[0], creds[1]
                 self._drain_submit_queue(0, u, p)
                 self._maybe_check_sweep(u, p)
+                self._maybe_superalpha(u, p)
             except Exception as e:
                 LOG.warning('드레인 티커 실패(무시): %s', e)
+
+    def _maybe_superalpha(self, username: str, password: str) -> None:
+        """슈퍼알파 1런을 플랫폼 하루(미 동부 자정 기준)에 한 번 띄운다.
+
+        슈퍼알파는 제출 한도가 일반·PP 와 따로다(SUPER_SUBMISSION). 2026-10-31 실측:
+        PP 월 한도가 차 일반 제출이 사흘째 0건이던 날에도 super simulation 권한은
+        열려 있었다. 런은 별도 스레드에서 순차 시뮬하고 FAIL 0 이면 바로 낸다.
+        IQC_SUPERALPHA=0 이면 끈다.
+        """
+        if os.environ.get('IQC_SUPERALPHA', '1') == '0':
+            return
+        day0 = _db.day_start_ts()
+        if getattr(self, '_superalpha_day', 0.0) == day0:
+            return
+        self._superalpha_day = day0
+        try:
+            if _db.get_account_type(self.user_id) != 'research_consultant':
+                return
+            last = _db.superalpha_runs_list(self.user_id, limit=1)
+            if last and float(last[0]['ts']) >= day0:
+                return              # 오늘 이미 돌았다 (재시작·수동 런 포함)
+            from . import superalpha as _sa
+            _sa.start_background(self.user_id, username, password,
+                                 seed_plus=int(day0 // 86400) % 1000,
+                                 log_fn=lambda m: self._log(0, m),
+                                 stop_event=self._stop_event)
+            self._log(0, '  🧬 오늘 슈퍼알파 1런 시작 — 순차 시뮬, FAIL 0 이면 제출')
+        except Exception as e:
+            self._log_quiet(0, f'⚠ 슈퍼알파 런 시작 실패(무시): {e}')
 
     def _maybe_check_sweep(self, username: str, password: str) -> None:
         """무료 체크로 오늘 기준 판정을 받아 온다 (하루 1회). 통과 가능하면 바로 낸다.

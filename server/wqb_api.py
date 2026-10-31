@@ -1067,6 +1067,30 @@ class WqbApiClient:
             LOG.warning('alpha %s description PATCH err: %s', alpha_id, e)
             return False
 
+    def set_super_description(self, alpha_id: str, selection: str, combo: str) -> bool:
+        """슈퍼알파의 selection·combo 설명을 PATCH 한다 — 둘 다 100자 미만이면 제출 거절.
+
+        2026-10-31 실측 403: COMBO_DESCRIPTION_LENGTH(0 vs 100);
+        SELECTION_DESCRIPTION_LENGTH(0 vs 100). 슈퍼알파 JSON 엔 regular 가 null 이고
+        selection·combo 아래에 description 이 따로 있다(ACE set_alpha_properties 와 같은 계약).
+        """
+        if not alpha_id or not self._ensure_auth():
+            return False
+        try:
+            r = self.session.patch(
+                f'{BASE}/alphas/{alpha_id}',
+                json={'selection': {'description': str(selection)[:4000]},
+                      'combo': {'description': str(combo)[:4000]}},
+                headers={'Accept': _API_ACCEPT}, timeout=_HTTP_TIMEOUT)
+            if 200 <= r.status_code < 300:
+                return True
+            LOG.warning('super %s description PATCH %s: %s',
+                        alpha_id, r.status_code, (r.text or '')[:120])
+            return False
+        except Exception as e:
+            LOG.warning('super %s description PATCH err: %s', alpha_id, e)
+            return False
+
     def check_alpha(self, alpha_id: str, stop_event=None, tries: int = 12) -> dict | None:
         """Return the latest submission-check payload without submitting.
 

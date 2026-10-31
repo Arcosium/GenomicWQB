@@ -532,11 +532,11 @@
         데이터필드 수·OS 시작일로 거른 뒤 최대 10개 선택)과, 고른 알파들의 통계를 하나로
         합치는 <b>combo</b>(<code>rank(stats.hold_value)</code> 같은 식)입니다.
         제출 이력이 쌓일수록 재료가 늘어 강해집니다.</p>
-        <p class="micro">⚠ super simulation 은 <b>CONSULTANT 와 별개 권한</b>입니다.
-        권한이 없으면 WQB 가 <code>Not permissioned for super simulations</code> 로
-        거절합니다 — WorldQuant 에 별도로 요청해야 합니다. 이 시스템의 실행 경로는
-        준비돼 있어서, 권한을 받으면 코드 수정 없이 바로 동작합니다.
-        자동 제출은 하지 않고 결과만 기록합니다(제출 판단은 사람이 합니다).</p>
+        <p class="micro">슈퍼알파는 <b>제출 한도가 일반·Power Pool 과 따로</b>입니다
+        (체크 이름 <code>SUPER_SUBMISSION</code>). 그래서 PP 월 한도가 찬 날에도 낼 수
+        있습니다. 시스템이 <b>하루 한 번(KST 13:00 리셋 뒤)</b> 조합 6개를 차례로 시뮬하고,
+        FAIL 이 하나도 없는 첫 결과를 바로 제출합니다. 회전율 상한은 일반 알파(70%)보다
+        낮은 <b>40%</b>입니다. 2026-10-31 기준 이 계정은 super simulation 권한이 있습니다.</p>
 
         <h3>제출 기준 (컨설턴트)</h3>
         <p>고정된 하나의 컷이 아니라 <b>두 갈래</b>입니다.</p>
