@@ -135,24 +135,48 @@ def _metric_float(row: dict, key: str) -> float:
         return float('-inf')
 
 
-# '좋은 알파' margin 하한 — WQB 한국 중급 스프린트 과제 3 기준(ASI·KOR·HKG·TWN 15bps, 그 외 10bps).
-_GOOD_MARGIN = {'ASI': 0.0015, 'KOR': 0.0015, 'HKG': 0.0015, 'TWN': 0.0015}
-_GOOD_MARGIN_DEFAULT = 0.0010
+_GOOD_MARGIN = _criteria.GOOD_MARGIN_BY_REGION
+_GOOD_MARGIN_DEFAULT = _criteria.GOOD_MARGIN_DEFAULT
 
 
-def _drain_key(row: dict, seen_fields: set) -> tuple:
-    """드레인 순서 — ① 이번 분기 제출작에 없던 필드를 쓰나 ② margin 하한·단일 데이터셋인가 ③ 샤프.
+def _low_margin(metrics: dict) -> bool:
+    margin = _criteria.margin(metrics or {})
+    return margin is not None and margin < _criteria.good_margin((metrics or {}).get('region'))
 
-    샤프순만 쓰면 하루 4칸을 같은 계보의 고샤프 변주가 차지한다. 2026-10 실측: 제출 47건 중
-    sweep 27건, anl69_best_pe_ratio 한 필드가 15건 — Genius 타이브레이커 '총 고유 필드 수'
-    하위권. 신선 후보가 없는 날은 그대로 샤프순이라 하루 제출 리듬은 안 깨진다. 동률은 오래된 것부터.
-    """
+
+def _margin_release_window(now=None) -> bool:
+    """미 동부 자정 직전 한 시간. DST 전환일도 달력으로 계산한다."""
+    import datetime as dt
+    from zoneinfo import ZoneInfo
+    now = time.time() if now is None else now
+    local = dt.datetime.fromtimestamp(now, ZoneInfo('America/New_York'))
+    tomorrow = local.date() + dt.timedelta(days=1)
+    reset = dt.datetime.combine(tomorrow, dt.time(), local.tzinfo).timestamp()
+    return reset - 3600 <= now < reset
+
+
+def _pyramid_counts(user_id: int) -> dict | None:
+    try:
+        from . import pyramids
+        return dict(pyramids.counts(user_id))
+    except Exception as e:
+        LOG.warning('피라미드 조회 실패: %s', e)
+        return None
+
+
+def _drain_key(row: dict, seen_fields: set, pyramid_counts: dict | None = None) -> tuple:
+    """margin 충족 → 신선 필드 → 미달 피라미드 → 단일 데이터셋 → Sharpe."""
+    from . import pyramids
     code = str(row.get('code') or '')
+    metrics = row.get('metrics') or {}
     fresh = bool(_alpha_ast.fields_used(code) - seen_fields)
-    region = str((row.get('metrics') or {}).get('region') or '').upper()
-    good = (_metric_float(row, 'margin') >= _GOOD_MARGIN.get(region, _GOOD_MARGIN_DEFAULT)
-            and len(_datasets_used_by_code(code)) == 1)
-    return (fresh, good, _metric_float(row, 'sharpe'), -int(row['id']))
+    margin = _criteria.margin(metrics)
+    good = margin is not None and margin >= _criteria.good_margin(metrics.get('region'))
+    cells = {x.strip().upper() for x in str(metrics.get('pyramids') or '').split(',') if x.strip()}
+    short = pyramid_counts is not None and any(
+        pyramid_counts.get(c, 0) < pyramids.PYRAMID_MIN for c in cells)
+    solo = len(_datasets_used_by_code(code)) == 1
+    return (good, fresh, short, solo, _metric_float(row, 'sharpe'), -int(row['id']))
 
 
 _PP_CLOSED_CACHE: dict = {}     # user_id → (조회 시각, 결과)
@@ -661,6 +685,16 @@ class Worker(threading.Thread):
             # 넣지도 못했으면서 '→queued' 라고 적지 않는다 — 라이브 피드가 거짓말한다.
             tail = '→queued' if queued else '→미보관'
             return False, f'daily_budget({used}/{DAILY_SUBMIT_BUDGET}){tail}'
+        if _low_margin(metrics or {}) and not _margin_release_window():
+            wid = str((metrics or {}).get('wqb_alpha_id') or '')
+            if wid:
+                try:
+                    _db.submit_queue_add(
+                        self.user_id, wqb_alpha_id=wid, kind='budget', code=str(code or ''),
+                        note='margin 기준 미달 — 일일 리셋 1시간 전 재시도', metrics=dict(metrics or {}))
+                    return False, 'low_margin→queued'
+                except Exception as e:
+                    LOG.warning('저마진 보관 실패(제출 진행): %s', e)
         # 프로덕션 상관 선독 벽은 2026-08-20 사장 지시로 제거 — "일단 쏘는 건 자원이
         # 안 드니까 쏴보고 실패하면 그때 넣어라". 이 API 는 신뢰 불가 판정이 나 있고
         # (준비 무관 빈 본문·수 분 사이 값 요동 — 2026-08-13 실측), 실제로 0.7146 같은
@@ -735,6 +769,8 @@ class Worker(threading.Thread):
                                                 code=str(c.get('code') or ''))
             if not ok_gate:
                 self._log_quiet(round_num, f"⏭ 제출 재시도 보류 (#{c['id']}): {reason}")
+                if reason == 'low_margin→queued':
+                    continue
                 return
             self._log(round_num,
                       f"  🔁 끊긴 제출 재시도 — 알파 #{c['id']} "
@@ -927,18 +963,20 @@ class Worker(threading.Thread):
             # 큐가 비었는데 주기마다 API 를 두드리는 낭비를 막는다.
             # limit 은 넉넉히 — 목록은 최신순이라 200 이면 오래된 대기 건이 샤프 정렬에서 빠진다.
             # 오늘 쿼터에 막힌 건은 다음 리셋(13:00)까지 다시 집지 않는다.
-            from .submit_push import _day0
-            _d0 = _day0(time.time())
+            _d0 = _db.day_start_ts()
             rows = [r for r in _db.submit_queue_list(self.user_id, limit=5000)
                     if r.get('kind') == 'budget' and r.get('status') == 'pending'
                     and int(r['id']) not in set(skip)
                     and not (str(r.get('note') or '').startswith(QUOTA_WAIT_NOTE)
                              and float(r.get('updated_at') or 0) >= _d0)]
+            if not _margin_release_window():
+                rows = [r for r in rows if not _low_margin(r.get('metrics') or {})]
             if not rows:
                 return None
-            # 신선 필드 → 좋은 알파 → 샤프 순 (2026-10-20, 이전엔 샤프순만) — _drain_key 참고.
+            # margin 품질선 → 신선 필드 → 미달 피라미드 칸 순.
             _seen = _quarter_submitted_fields(self.user_id)
-            row = max(rows, key=lambda r: _drain_key(r, _seen))
+            _counts = _pyramid_counts(self.user_id)         # 칸 집계는 판당 1회
+            row = max(rows, key=lambda r: _drain_key(r, _seen, _counts))
             if self._submitted_today() >= DAILY_SUBMIT_BUDGET:
                 return None
         except Exception:
@@ -1095,8 +1133,37 @@ class Worker(threading.Thread):
                 self._drain_submit_queue(0, u, p)
                 self._maybe_check_sweep(u, p)
                 self._maybe_superalpha(u, p)
+                self._maybe_post_submission(u, p)
             except Exception as e:
                 LOG.warning('드레인 티커 실패(무시): %s', e)
+
+    def _maybe_post_submission(self, username: str, password: str) -> None:
+        """OS 조회는 별도 스레드에서 수행해 제출 티커를 막지 않는다."""
+        thread = getattr(self, '_post_submission_thread', None)
+        if thread is not None and thread.is_alive():
+            return
+        now = time.time()
+        if now < getattr(self, '_post_submission_retry', 0):
+            return
+        self._post_submission_retry = now + 3600
+
+        def run():
+            from . import post_submission
+            from .wqb_api import WqbApiClient
+            client = WqbApiClient(username, password)
+            try:
+                if client._load_session():
+                    count = post_submission.refresh(self.user_id, client, self._stop_event)
+                    if count:
+                        self._log(0, f'제출 후 OS 성과 {count}건 갱신')
+            except Exception as e:
+                LOG.warning('OS 성과 갱신 실패: %s', e)
+            finally:
+                client.session.close()
+
+        self._post_submission_thread = threading.Thread(target=run, daemon=True,
+                                                        name=f'os-feedback-{self.user_id}')
+        self._post_submission_thread.start()
 
     def _maybe_superalpha(self, username: str, password: str) -> None:
         """슈퍼알파 1런을 플랫폼 하루(미 동부 자정 기준)에 한 번 띄운다.
@@ -1602,6 +1669,13 @@ class Worker(threading.Thread):
             except Exception as e:
                 self._log_quiet(round_num, f'⚠ v2.1 시드 재선정 실패(기존 순서 유지): {e}')
                 seeds = seeds[:5]
+        if is_focus and (focus_entry or {}).get('parent_alpha_id'):
+            _parent_row = _db.get_alpha_by_id(self.user_id, focus_entry['parent_alpha_id']) or {}
+            parent_metrics['_submitted'] = bool(_parent_row.get('submitted'))
+            if not parent_metrics.get('region') and _parent_row.get('region'):
+                parent_metrics['region'] = _parent_row['region']
+        if is_focus and not parent_metrics.get('region'):
+            parent_metrics['region'] = parent_settings.get('region') or getattr(_constraint, 'region', None) or 'USA'
         seed_genomes: list[dict] = []
         seed_alpha_ids: list[int | None] = []
         seed_metrics: list[dict] = []
@@ -1621,6 +1695,9 @@ class Worker(threading.Thread):
                 from .submission_feedback import observations
                 _seed_m = dict(sd.get('metrics') or {})
                 _seed_m['_submit_checks'] = observations(sd)
+                _seed_m['_submitted'] = bool(sd.get('submitted'))
+                if not _seed_m.get('region'):
+                    _seed_m['region'] = sd.get('region') or getattr(_constraint, 'region', None) or 'USA'
                 seed_metrics.append(_seed_m)
         if _dropped_seeds:
             self._log(round_num,
@@ -1683,11 +1760,13 @@ class Worker(threading.Thread):
             #   (p+1)/(v+2)=0.5 프라이어는 콜드 arm 에 mean 의 2~3배 보너스를 줘
             #   착취 순위를 통째로 뒤집는다. 전역 앵커면 콜드 arm 은 중립이다.
             _arms = _db.bandit_stats(self.user_id)
+            from .post_submission import bandit_adjustments
+            _os_bonus = bandit_adjustments(self.user_id)
             _tv = sum(int(a['visits']) for a in _arms)
             _g = (sum(int(a.get('pass_sum') or 0) for a in _arms) / _tv) if _tv else 0.0
             _K = 50.0   # 관측 50회쯤부터 arm 실측이 프라이어를 이긴다
             _stats = {
-                a['arm_key']: a['mean'] + YIELD_WEIGHT
+                a['arm_key']: a['mean'] + _os_bonus.get(a['arm_key'], 0.0) + YIELD_WEIGHT
                 * ((int(a.get('pass_sum') or 0) + _K * _g) / (int(a['visits']) + _K))
                 for a in _arms
             }

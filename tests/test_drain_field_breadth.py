@@ -27,15 +27,16 @@ def test_good_margin_single_dataset_breaks_tie(monkeypatch):
 def test_asi_needs_15bps(monkeypatch):
     monkeypatch.setattr(w, '_datasets_used_by_code', lambda code: {'ds'})
     r = _row(1, 'rank(f1)', 1.5, margin=0.0012, region='ASI')
-    assert w._drain_key(r, set())[1] is False
+    assert w._drain_key(r, set())[0] is False
     r = _row(1, 'rank(f1)', 1.5, margin=0.0012, region='GLB')
-    assert w._drain_key(r, set())[1] is True
+    assert w._drain_key(r, set())[0] is True
 
 
-def test_two_datasets_is_not_good(monkeypatch):
+def test_two_datasets_does_not_lose_margin_credit(monkeypatch):
     monkeypatch.setattr(w, '_datasets_used_by_code', lambda code: {'a', 'b'})
     r = _row(1, 'rank(f1)', 1.5, margin=0.002)
-    assert w._drain_key(r, set())[1] is False
+    assert w._drain_key(r, set())[0] is True
+    assert w._drain_key(r, set())[3] is False
 
 
 def test_same_fields_fall_back_to_sharpe(monkeypatch):

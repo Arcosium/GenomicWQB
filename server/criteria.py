@@ -528,6 +528,28 @@ def required_returns(turnover):
     return MARGIN_TURNOVER_FACTOR * t * TRANSACTION_COST
 
 
+# 생성 보상과 제출 우선순위가 공유하는 리전별 margin 기준.
+GOOD_MARGIN_BY_REGION = {'ASI': 0.0015, 'KOR': 0.0015, 'HKG': 0.0015, 'TWN': 0.0015}
+GOOD_MARGIN_DEFAULT = 0.0010
+
+
+def good_margin(region=None) -> float:
+    """리전별 '낼 만한 알파' margin 하한(비율). 몰라도 기본 10bps 를 요구한다."""
+    return GOOD_MARGIN_BY_REGION.get(str(region or '').strip().upper(),
+                                     GOOD_MARGIN_DEFAULT)
+
+
+SLOW_TURNOVER_TARGET = 0.12
+STANDARD_TURNOVER_TARGET = 0.15
+SLOW_TURNOVER_MAX = 0.20
+
+
+def ht_eligible_region(region) -> bool:
+    """고회전(HTVR) 강등 혜택이 열리는 리전인가. 리전을 모르면 옛 동작(가능)으로 둔다."""
+    r = str(region or '').strip().upper()
+    return True if not r else r == HT_REGION
+
+
 def after_cost_sharpe(metrics):
     """후비용 Sharpe. 실측(HT_AFTER_COST_SHARPE)이 있으면 그것, 없으면 마진에서 계산.
 

@@ -86,6 +86,8 @@ Gates (return 0.0 immediately)
 # 같은 PEP604 union 을 지연 평가(문자열)로 처리해 import 시 TypeError 를 방지한다.
 from __future__ import annotations
 
+import math
+
 from . import criteria as _criteria
 
 # ── Tunable module-level reference constants ─────────────────────────────────
@@ -190,9 +192,31 @@ def _clamp(x: float, lo: float, hi: float) -> float:
 LOW_TURNOVER_BAND: tuple = (0.10, 0.15)
 #: 두 봉우리 사이 골의 깊이. 0 으로 두면 GA 가 대역을 못 건너간다.
 BAND_VALLEY: float = 0.72
+#: HT 면제가 닫힌 리전에서 SLOW_TURNOVER_MAX(20%) 지점의 점수. 만점 대역(10~15%) 과
+#: 같은 높이로 두면 decay 를 올릴 이유가 없고, 0 으로 두면 느린 신호로만 미끄러진다.
+SLOW_PEAK_VALLEY: float = 0.45
 
 
-def _turnover_term(turnover: float, cap: float = _criteria.TURNOVER_MAX) -> float:
+def _low_turnover_term(turnover: float, cap: float = _criteria.TURNOVER_MAX) -> float:
+    """HT 혜택이 없는 리전은 회전율 10~15%에 최고점을 준다."""
+    t = max(0.0, float(turnover or 0.0))
+    hi = cap if cap and cap > 0 else _criteria.TURNOVER_MAX
+    band_lo, band_hi = LOW_TURNOVER_BAND
+    slow_max = _criteria.SLOW_TURNOVER_MAX
+    if t <= 0 or t >= hi:
+        return 0.0
+    if t < band_lo:
+        return _clamp(t / band_lo, 0.0, 1.0)
+    if t <= band_hi:
+        return 1.0
+    if t <= slow_max:
+        return _clamp(1.0 - (1.0 - SLOW_PEAK_VALLEY) * (t - band_hi) / (slow_max - band_hi),
+                      SLOW_PEAK_VALLEY, 1.0)
+    return _clamp(SLOW_PEAK_VALLEY * (hi - t) / (hi - slow_max), 0.0, SLOW_PEAK_VALLEY)
+
+
+def _turnover_term(turnover: float, cap: float = _criteria.TURNOVER_MAX,
+                   region=None) -> float:
     """회전율 대역 항 — **두 제출 경로에 각각 봉우리**를 둔다.
 
     2026-07-21 에는 고회전 대역(20~65%)만 만점이었다. 주간 테마가 HT 분류를 요구했고,
@@ -210,7 +234,13 @@ def _turnover_term(turnover: float, cap: float = _criteria.TURNOVER_MAX) -> floa
 
     구간: [0, 0.10) 상승 · [0.10, 0.15] 만점(표준 경로) · (0.15, 0.20) 골
           · [0.20, 0.65] 만점(HT 경로) · (0.65, 0.70) 급감 · ≥0.70 은 0
+
+    ⚠ 2026-11-03 — HT 경로는 USA 만 열린다. `region` 을 주면 HT 면제가 닫힌 리전은
+    `_low_turnover_term` 으로 간다(회전율 20% 이상이 보상과 무관해진다). 리전을 모르면
+    (region=None) 두 봉우리를 다 열어 옛 동작을 유지한다 — 측정 전에 방향을 죽이지 않는다.
     """
+    if not _criteria.ht_eligible_region(region):
+        return _low_turnover_term(turnover, cap)
     t = max(0.0, float(turnover or 0.0))
     hi = cap if cap and cap > 0 else _criteria.TURNOVER_MAX
     safe_hi = hi * 0.93           # 0.70 대비 0.65 — 컷 바로 밑에 붙지 않게 여유를 둔다
@@ -262,20 +292,12 @@ def damp_if_positive(value: float, turnover: float,
     return v * _overshoot_factor(turnover, cap)
 
 
-def _margin_term(turnover: float, returns: float) -> float:
-    """후비용 마진 항 — 강등선까지의 거리 [0,1]. 1.0 = 후비용 Sharpe > 0 도달.
-
-    강등 조건 `후비용 Sharpe > 0` 은 닫힌 형태로 `returns > 0.1512 × turnover` 다
-    (`criteria.required_returns`). 그 비율을 그대로 점수로 준다.
-
-    핵심은 **분모에 회전율이 들어간다**는 것이다 — 회전율만 올리는 전략은 여기서
-    자동으로 처벌받는다(회전율 143% 면 수익률 21.7% 를 내야 1.0 이 된다). 반대로
-    2026-07-21 강등 성공 5건(회전율 40~62% · 수익률 7.5~11.4%)은 전부 1.0 이다.
-    """
-    need = _criteria.required_returns(turnover)
-    if not need or need <= 0:
+def _margin_term(turnover: float, returns: float, region=None, margin=None) -> float:
+    """리전별 품질선에서 포화한다. HT 거래비용 판정은 criteria에 남긴다."""
+    mg = _criteria.margin({'turnover': turnover, 'returns': returns, 'margin': margin})
+    if mg is None or not math.isfinite(mg):
         return 0.0
-    return _clamp(float(returns or 0.0) / need, 0.0, 1.0)
+    return _clamp(mg / _criteria.good_margin(region), 0.0, 1.0)
 
 
 def _route_term(metrics: dict) -> float:
@@ -336,7 +358,8 @@ def _base_score(metrics: dict, w: dict, sharpe: float, fitness: float,
     """
     score = (
         w.get('route',      DEFAULT_WEIGHTS['route'])      * _route_term(metrics)
-        + w.get('margin',     DEFAULT_WEIGHTS['margin'])     * _margin_term(turnover, returns)
+        + w.get('margin',     DEFAULT_WEIGHTS['margin'])     * _margin_term(
+            turnover, returns, metrics.get('region'), metrics.get('margin'))
         + w.get('multiplier', DEFAULT_WEIGHTS['multiplier']) * _multiplier_term(metrics)
         + w.get('sharpe',     DEFAULT_WEIGHTS['sharpe'])     * _clamp(sharpe / SHARPE_REF, 0.0, 1.0)
         + w.get('fitness',    DEFAULT_WEIGHTS['fitness'])    * _clamp(fitness / FITNESS_REF, 0.0, 1.0)
@@ -417,7 +440,7 @@ def compute_reward(
 
     # ── 5-6. Base score (7항: route·multiplier·sharpe·fitness·returns·turnover·htclass) ──
     base = _base_score(metrics, w, sharpe, fitness, turnover, returns, turnover_cap,
-                       _turnover_term(turnover, turnover_cap))
+                       _turnover_term(turnover, turnover_cap, metrics.get('region')))
 
     # ── 7. Self-correlation penalty ──────────────────────────────────────────
     penalty = 0.0
@@ -529,7 +552,7 @@ def selection_score(
 
     # turnover 결측/0 은 '측정 안 됨' 이지 '완벽' 이 아니다 → 가산점 없음.
     # (측정된 turnover 는 고회전 대역 20~65% 에서 만점 — _turnover_term docstring 참조.)
-    turnover_term = (_turnover_term(turnover, turnover_cap)
+    turnover_term = (_turnover_term(turnover, turnover_cap, metrics.get('region'))
                      if (turnover > 0 and turnover_cap > 0) else 0.0)
 
     base = _base_score(metrics, w, sharpe, fitness, turnover, returns, turnover_cap,

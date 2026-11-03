@@ -69,14 +69,25 @@ def categorize(fail_items: Iterable[str] | None, metrics: dict | None = None) ->
     미달은 FAIL 이 아니라 WARNING 이라 사유 문자열에 없는데, 개편된 규칙에선 그게
     제출을 막는 진짜 원인이다(회전율 20% 미만 → 표준 컷 강등을 못 받음 → LOW_SHARPE
     FAIL). 이 경우 'ht_gap' 을 **맨 앞에** 넣어 churn 축이 우선 선택되게 한다.
+
+    HT 혜택이 없는 리전에는 churn 대신 저회전 변이를 적용한다.
     """
     out: list[str] = []
     if metrics:
         try:
             from . import criteria as _criteria
-            st = _criteria.ht_status(metrics)
-            if not st['eligible'] and 'turnover' in (st.get('gaps') or []):
+            region = (metrics or {}).get('region')
+            st = _criteria.ht_status(metrics, region=region or _criteria.HT_REGION)
+            if (_criteria.ht_eligible_region(region)
+                    and not st['eligible'] and 'turnover' in (st.get('gaps') or [])):
                 out.append('ht_gap')
+            if not _criteria.ht_eligible_region(region):
+                try:
+                    to = float((metrics or {}).get('turnover') or 0.0)
+                except (TypeError, ValueError):
+                    to = 0.0
+                if to > _criteria.SLOW_TURNOVER_MAX:
+                    out.append('turnover_high')
         except Exception:
             pass
     for it in fail_items or []:

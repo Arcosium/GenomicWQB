@@ -184,7 +184,7 @@ def test_rc_delay_zero_constraint_survives_mutation_and_crossover(monkeypatch):
         assert all(f in pv for f in r['genome']['fields']), r['genome']
         assert r['settings']['delay'] == '0'
         assert r['genome']['neutralization'] != 'NONE'
-        assert r['genome']['decay'] <= 8
+        assert 0 <= r['genome']['decay'] <= 60
 
 
 def test_bandit_arms_apply_to_random_slots_in_order():

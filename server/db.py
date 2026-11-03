@@ -47,7 +47,7 @@ _INITIALIZED = False
 # 스키마/데이터 마이그레이션 버전. ALTER·백필을 프로세스마다 재실행하지 않도록
 # PRAGMA user_version 게이트의 기준값. 향후 스키마/데이터 마이그레이션을
 # 추가하면 반드시 이 값을 올려야 새 마이그레이션이 1회 적용된다.
-_SCHEMA_VERSION = 9   # v9: users.submit_mode ('auto' 자동제출 | 'list' 대기목록만)
+_SCHEMA_VERSION = 10  # v10: 제출 후 OS 최신 관측
 _FERNET: Fernet | None = None
 
 FEEDBACK_CAP = 30
@@ -304,6 +304,19 @@ def init() -> None:
             CREATE INDEX IF NOT EXISTS idx_submit_attempts_user
                 ON submit_attempts(user_id, id);
 
+            CREATE TABLE IF NOT EXISTS post_submission (
+                user_id INTEGER NOT NULL,
+                wqb_alpha_id TEXT NOT NULL,
+                alpha_id INTEGER NOT NULL,
+                checked_at REAL NOT NULL,
+                snapshot TEXT NOT NULL,
+                arm_keys TEXT NOT NULL DEFAULT '[]',
+                score REAL,
+                PRIMARY KEY (user_id, wqb_alpha_id),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(alpha_id) REFERENCES alphas(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS bandit_arms (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -496,7 +509,8 @@ def init() -> None:
             # CREATE TABLE IF NOT EXISTS 는 신규 DB 위해 항상 실행하되, ALTER·백필은
             # 프로세스마다 재실행할 필요가 없어 user_version < _SCHEMA_VERSION 일 때 1회만.
             _ver = conn.execute("PRAGMA user_version").fetchone()[0]
-            if _ver < _SCHEMA_VERSION:
+            if _ver < 9:
+                # v1~v9 백필은 새 테이블 추가만으로 반복하지 않는다.
                 # 마이그레이션 — 기존 DB 에 신규 컬럼 없으면 추가.
                 cols = {r['name'] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
                 if 'submittable_list_created' not in cols:
@@ -675,6 +689,7 @@ def init() -> None:
                     conn.execute("ALTER TABLE users ADD COLUMN submit_mode TEXT "
                                  "NOT NULL DEFAULT 'auto'")
 
+            if _ver < _SCHEMA_VERSION:
                 conn.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         _INITIALIZED = True
 
@@ -1686,6 +1701,8 @@ def _hydrate_alpha_row(r) -> dict[str, Any] | None:
     # 못 얻고 표준컷에 막힌다(2026-09-20~22 전멸의 원인, wqb_api._rejection_reason 참조).
     if 'POWER_POOL_CORRELATION' in str(d.get('submit_status') or ''):
         return None
+    if not d['metrics'].get('region') and d.get('region'):
+        d['metrics']['region'] = d['region']
     # 유전체 JSON 이 lineage 의 권위. 컬럼은 폴백.
     d['genome'].setdefault('generation', int(d.get('generation') or 0))
     sh = d['metrics'].get('sharpe')
@@ -1705,7 +1722,7 @@ def _hydrate_alpha_row(r) -> dict[str, Any] | None:
 
 _SEED_COLS = ('id, code, code_hash, desc, pass_count, fail_count, error_count, '
               'metrics, round_num, idx, universe, neutralization, decay, truncation, '
-              'self_corr, generation, genome, fail_items, submit_status')
+              'self_corr, generation, genome, fail_items, submit_status, submitted, region')
 
 
 def _theme_order(records: list[dict[str, Any]], constraint) -> list[dict[str, Any]]:
@@ -3856,3 +3873,37 @@ def v2_lineage_submitted_today(user_id: int, code: str) -> bool:
                    for r in rows)
     except Exception:
         return False
+
+
+@_with_conn
+def post_submission_candidates(conn, user_id: int, before: float, limit: int = 200) -> list[dict]:
+    rows = conn.execute(
+        "SELECT a.*, json_extract(CASE WHEN json_valid(a.metrics) THEN a.metrics ELSE '{}' END, '$.wqb_alpha_id') AS wqb_alpha_id "
+        "FROM alphas a LEFT JOIN post_submission p ON p.user_id=a.user_id "
+        "AND p.wqb_alpha_id=json_extract(CASE WHEN json_valid(a.metrics) THEN a.metrics ELSE '{}' END, '$.wqb_alpha_id') "
+        "WHERE a.user_id=? AND a.submitted=1 AND json_valid(a.metrics) "
+        "AND COALESCE(json_extract(CASE WHEN json_valid(a.metrics) THEN a.metrics ELSE '{}' END, '$.wqb_alpha_id'), '')<>'' "
+        "AND (p.checked_at IS NULL OR p.checked_at<=?) "
+        "GROUP BY json_extract(CASE WHEN json_valid(a.metrics) THEN a.metrics ELSE '{}' END, '$.wqb_alpha_id') "
+        "HAVING a.id=MAX(a.id) ORDER BY COALESCE(p.checked_at, 0), a.id LIMIT ?",
+        (user_id, before, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@_with_conn
+def save_post_submission(conn, user_id: int, alpha_id: int, wqb_alpha_id: str,
+                         snapshot: dict, arms: list, score: float | None, checked_at: float):
+    # 한 행의 UPSERT라 재실행·재시작에도 지연 보상이 누적되지 않는다.
+    conn.execute(
+        'INSERT INTO post_submission VALUES (?,?,?,?,?,?,?) '
+        'ON CONFLICT(user_id,wqb_alpha_id) DO UPDATE SET '
+        'alpha_id=excluded.alpha_id, checked_at=excluded.checked_at, snapshot=excluded.snapshot, '
+        'arm_keys=excluded.arm_keys, score=excluded.score',
+        (user_id, wqb_alpha_id, alpha_id, checked_at, json.dumps(snapshot), json.dumps(arms), score))
+
+
+@_with_conn
+def post_submission_scores(conn, user_id: int, since: float) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        'SELECT arm_keys, score FROM post_submission '
+        'WHERE user_id=? AND checked_at>=? AND score IS NOT NULL', (user_id, since))]

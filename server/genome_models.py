@@ -405,7 +405,7 @@ def _coerce_genome(obj) -> Genome | None:
         d["lookback_b"] = max(1, min(252, int(d.get("lookback_b") or 60)))
         d.setdefault("universe", "TOP3000")
         d.setdefault("neutralization", "INDUSTRY")
-        d["decay"] = max(0, min(30, int(d.get("decay") or 0)))
+        d["decay"] = max(0, min(60, int(d.get("decay") or 0)))
         d["truncation"] = max(0.01, min(0.15, float(d.get("truncation") or 0.08)))
         d.setdefault("nan_handling", "OFF")
         d["decay_style"] = "linear" if str(d.get("decay_style") or "") == "linear" else "mean"
@@ -910,7 +910,10 @@ TURNOVER_TARGET = 0.60
 SWEEP_SLOTS = int(_os.environ.get("IQC_SWEEP_SLOTS", "2"))
 SWEEP_NEUTRALIZATIONS = ("STATISTICAL", "CROWDING", "SLOW_AND_FAST", "MARKET",
                          "SUBINDUSTRY", "INDUSTRY")
-SWEEP_DECAYS = (0, 2, 4, 6, 8, 12)
+SWEEP_DECAYS = (0, 2, 4, 6, 8, 12, 16)
+# 라운드당 '느린 형제' 슬롯 수(2026-11-03 리포트 권고 — 제출량은 그대로 두고 평균
+# 회전율을 낮추는 경로). 0 = 끄기.
+SLOW_SIBLING_SLOTS = int(_os.environ.get("IQC_SLOW_SIBLING_SLOTS", "1"))
 
 
 def _decay_factor(decay) -> float:
@@ -949,7 +952,14 @@ def decay_for_target_turnover(cur_decay, cur_turnover, target: float = TURNOVER_
             continue
         if to * (_decay_factor(d) / base) <= target:
             return d
-    return max(DECAY_TURNOVER_FACTOR)
+    return max(cur, max(DECAY_TURNOVER_FACTOR))
+
+
+def turnover_target_for_region(region) -> float:
+    """USA HT 경로와 표준 경로의 회전율 목표."""
+    from . import criteria as _criteria
+    return (TURNOVER_TARGET if _criteria.ht_eligible_region(region)
+            else _criteria.STANDARD_TURNOVER_TARGET)
 
 
 def _template_fields(text: str) -> set:
@@ -1171,7 +1181,7 @@ class BaseGenomeModel:
     # 이제 필드→데이터셋→카테고리 실매핑으로 분류하므로 GA 에 처음 열린다.
     families = ("pv", "fundamental", "analyst", "option", "news", "model",
                 "shortinterest", "imbalance")
-    decays = (0, 2, 4, 6, 8, 12, 20)
+    decays = (0, 2, 4, 6, 8, 12, 16, 20)
     truncations = (0.08, 0.1, 0.12)
 
     def __init__(self, *, round_num: int, forced_delay=None, errors=None, feedback=None,
@@ -1245,8 +1255,27 @@ class BaseGenomeModel:
                 ("spec", g, None) for g in self.spec_genomes[:n]]
             if len(plan) < n:
                 plan.extend(self._plan_ga(n - len(plan)))
+            return self._with_slow_sibling(plan, n)
+        return self._with_slow_sibling(self._plan_ga(n), n)
+
+    def _with_slow_sibling(self, plan, n: int):
+        """기존 sweep 한 칸만 제출 성공작의 느린 형제에 배정한다."""
+        if SLOW_SIBLING_SLOTS <= 0 or self.search_mode == 'escape':
             return plan
-        return self._plan_ga(n)
+        eligible = []
+        for g in dict.fromkeys(([self.parent] if self.parent else []) + self.seeds):
+            m = self._metrics_by_genome.get(g, {})
+            try:
+                if m.get('_submitted') and float(m.get('turnover') or 0) > 0.15:
+                    eligible.append(g)
+            except (ValueError, TypeError):
+                continue
+        if eligible:
+            for i, (op, _, _) in enumerate(plan):
+                if op == 'sweep':
+                    plan[i] = ('sibling', eligible[self.round_num % len(eligible)], None)
+                    break
+        return plan
 
     def _plan_ga(self, n: int) -> list[tuple[str, Genome | None, Genome | None]]:
         from .research_v2 import SINGLE_AXIS_SHARE, MAX_RANDOM_SHARE, refinement_eligible
@@ -1410,6 +1439,10 @@ class BaseGenomeModel:
                 g = self._sweep(a, slot, i)
                 base = a
                 directive = "sweep"
+            elif op == "sibling":
+                g = self._slow_sibling(a, rng)
+                base = a
+                directive = "slow_sibling"
             elif op == "crossover":
                 g = self._crossover(a, b, rng)
                 base = a
@@ -1514,29 +1547,36 @@ class BaseGenomeModel:
 
     def _mutate(self, parent: Genome, rng: random.Random, directed: bool = True) -> Genome:
         d = dict(parent.__dict__)
+        metrics = self._metrics_by_genome.get(parent, self.parent_metrics)
         directive = None
         if directed:
             from .submission_feedback import bottleneck
-            target = bottleneck({'metrics': self.parent_metrics})
+            target = bottleneck({'metrics': metrics})
             if self.search_mode != 'legacy' and target:
-                categories = _mutation_learn.categorize([target['name']])
+                from . import criteria as _criteria
+                categories = _mutation_learn.categorize(
+                    [target['name']], metrics if not _criteria.ht_eligible_region(
+                        metrics.get('region')) else None)
                 directive = _mutation_learn.RULE_DIRECTIVE.get(categories[0]) if categories else None
             elif self.directive_stats is not None:
                 # 온라인 학습 경로 — 누적 (fail category × directive) 성공률로
                 # Thompson sampling. 관측이 없으면 사전확률 = 기존 규칙 우세.
                 directive = _mutation_learn.choose_directive(
                     self.fail_items, self.directive_stats, rng,
-                    metrics=self.parent_metrics)
+                    metrics=metrics)
             else:
-                dirs = _directives(self.fail_items, self.parent_metrics)
+                dirs = _directives(self.fail_items, metrics)
                 directive = rng.choice(dirs) if dirs else None
         # generate() 가 후보 dict 에 귀속 기록으로 실어 보낸다.
         self._last_directive = directive
         if directive == "smooth":       # turnover 과다 → 스무딩 유전자 강화
             # 부모 회전율을 알면 **필요한 만큼만** 감쇠를 올린다. 눈감고 20 으로
             # 점프하면 Sharpe 를 통째로 버린다(실측: decay 4→20 이면 Sharpe 1.9→1.2).
-            _tgt = decay_for_target_turnover(int(d["decay"]),
-                                             self.parent_metrics.get("turnover"))
+            # 목표는 리전별 — HT 강등이 닫힌 리전에서 0.60 은 '이미 목표' 라 아무것도
+            # 안 고쳐진다(turnover_target_for_region 참조).
+            _tgt = decay_for_target_turnover(
+                int(d["decay"]), metrics.get("turnover"),
+                target=turnover_target_for_region(metrics.get("region")))
             d["decay"] = (_tgt if _tgt is not None
                           else max(int(d["decay"]), rng.choice((8, 12, 20))))
             # 표준 창 사다리를 1~2칸 올린다 (옛 ×2/×3 은 80·240 같은 비표준 창을 만들었다).
@@ -1640,7 +1680,7 @@ class BaseGenomeModel:
             # 필드·변환·결합은 그대로 둔다. 이미 살아 있는 전역 신호를 갈아엎지 않고,
             # 지역별 산업 구성과 이상치 민감도를 좌우하는 리스크 처리 축만 바꾼다.
             region_values = {
-                key: _mutation_learn._metric(self.parent_metrics, key)
+                key: _mutation_learn._metric(metrics, key)
                 for key in ("glb_amer_sharpe", "glb_emea_sharpe", "glb_apac_sharpe")
             }
             weak_region = min(
@@ -1796,7 +1836,9 @@ class BaseGenomeModel:
             d["neutralization"] = cand[(attempt - 1) % len(cand)]
         else:
             want = decay_for_target_turnover(int(d.get("decay") or 0),
-                                             effective_metrics({'metrics': parent_metrics}).get('turnover'))
+                                             effective_metrics({'metrics': parent_metrics}).get('turnover'),
+                                             target=turnover_target_for_region(
+                                                 (parent_metrics or {}).get('region')))
             if want is not None and want != int(d.get("decay") or 0):
                 d["decay"] = want
             else:
@@ -1808,6 +1850,19 @@ class BaseGenomeModel:
                 cand = [t for t in self.transforms if t != cur] or list(self.transforms)
                 d["transform_a"] = cand[(attempt - 1) % len(cand)]
         d["generation"] = int(d.get("generation") or 0) + 1
+        return Genome(**d)
+
+    def _slow_sibling(self, parent: Genome, rng: random.Random) -> Genome:
+        """감쇠와 두 lookback만 늘려 같은 아이디어를 비교한다."""
+        from . import criteria
+        d = dict(parent.__dict__)
+        pm = self._metrics_by_genome.get(parent, {})
+        want = decay_for_target_turnover(parent.decay, pm.get('turnover'),
+                                         target=criteria.SLOW_TURNOVER_TARGET)
+        d['decay'] = max(parent.decay, want if want is not None else parent.decay)
+        d['lookback_a'] = _next_longer(parent.lookback_a)
+        d['lookback_b'] = _next_longer(parent.lookback_b)
+        d['generation'] = int(parent.generation or 0) + 1
         return Genome(**d)
 
     def _constrain(self, g: Genome, rng: random.Random) -> Genome:
@@ -1955,7 +2010,7 @@ class ResearchConsultantGenomeModel(BaseGenomeModel):
     # 3번째 유전자가 죽은 채로 교차/변이만 돌았다. ts_mean 도 같은 이유로 복원한다.
     transforms = ("rank", "ts_rank", "ts_zscore", "ts_delta", "ts_mean", "ts_av_diff")
     combines = ("spread", "sum", "product", "ratio", "corr", "triple", "resid")
-    decays = (0, 2, 4, 6, 8)
+    decays = BaseGenomeModel.decays
     truncations = (0.08, 0.1)
 
     def _constrain(self, g: Genome, rng: random.Random) -> Genome:
@@ -1963,7 +2018,8 @@ class ResearchConsultantGenomeModel(BaseGenomeModel):
         d = dict(g.__dict__)
         if d["neutralization"] == "NONE":
             d["neutralization"] = "MARKET"
-        d["decay"] = min(int(d["decay"]), 8)
+        # 저회전·탈상관 변이가 고른 감쇠를 8로 되돌리지 않는다.
+        d["decay"] = max(0, min(int(d["decay"]), 60))
         d["truncation"] = min(max(float(d["truncation"]), 0.08), 0.1)
         d["nan_handling"] = "OFF"
         # RC 는 API 가 모든 후보를 제출 시도하므로 보수적으로: 이상치 절단은 off/4 만.

@@ -47,10 +47,10 @@ def test_runaway_turnover_scores_below_healthy_alpha():
 
 # ── ② 후비용 마진 항: 강등의 유일한 판별자를 직접 겨냥 ──────────────────────────
 
-def test_margin_term_full_at_waiver_line():
-    """수익률 = 0.1512 × 회전율 이면 후비용 Sharpe 부호가 넘어간다 → 만점."""
-    assert reward._margin_term(0.40, 0.1512 * 0.40) == pytest.approx(1.0)
-    assert reward._margin_term(0.40, 0.20) == pytest.approx(1.0)   # 넘겨도 만점(클램프)
+def test_margin_term_full_at_quality_line():
+    assert reward._margin_term(.4, 504 * .4 * .0003) == pytest.approx(.3)
+    assert reward._margin_term(.4, 504 * .4 * .001) == pytest.approx(1.0)
+    assert reward._margin_term(.4, 504 * .4 * .002) == pytest.approx(1.0)
 
 
 def test_margin_term_punishes_raising_turnover_alone():
@@ -60,11 +60,11 @@ def test_margin_term_punishes_raising_turnover_alone():
 
 
 def test_margin_term_matches_yesterdays_waiver_cases():
-    """2026-07-21 실측 5건 — 강등된 3건은 1.0, 탈락한 2건은 그 아래여야 한다."""
+    """HT 거래비용 면제선과 새 품질 목표는 별개다."""
     waived = [(0.60, 0.1140), (0.54, 0.1109), (0.40, 0.0754)]     # np8k1q38 · gJ9qkKWv · QP9rLo5Q
     failed = [(0.62, 0.0860), (0.615, -0.0242)]                    # E5eo9OLG · RR1Zn0Ng
     for turn, ret in waived:
-        assert reward._margin_term(turn, ret) == pytest.approx(1.0), (turn, ret)
+        assert 0.3 < reward._margin_term(turn, ret) < 1.0, (turn, ret)
     for turn, ret in failed:
         assert reward._margin_term(turn, ret) < 1.0, (turn, ret)
 

@@ -1040,6 +1040,29 @@ class WqbApiClient:
             metrics[_constraint_spec.CHECK_RESULTS_METRIC] = all_check_results
         return {'metrics': metrics, 'is_status': out}
 
+    def harvest_post_submission(self, alpha_id: str) -> dict | None:
+        """저장된 세션으로 OS와 제출일만 읽는다. 재인증이나 제출은 하지 않는다. 개별 결측은 {}, 일시 장애는 None."""
+        if not alpha_id:
+            return {}
+        try:
+            response = self.session.get(f'{BASE}/alphas/{alpha_id}', timeout=_HTTP_TIMEOUT,
+                                        headers={'Accept': _API_ACCEPT})
+            if not response.ok:
+                return {} if response.status_code in (404, 410) else None
+            try:
+                data = response.json()
+            except ValueError:
+                return {}
+            if not isinstance(data, dict):
+                return {}
+            return {
+                'stage': data.get('stage'), 'dateSubmitted': data.get('dateSubmitted'),
+                'os': data.get('os') if isinstance(data.get('os'), dict) else {},
+                'settings': data.get('settings') if isinstance(data.get('settings'), dict) else {},
+            }
+        except (requests.RequestException, ValueError):
+            return None
+
     def set_alpha_description(self, alpha_id: str, description: str) -> bool:
         """알파의 regular.description 을 PATCH 로 설정한다 (Power Pool 필수 요건).
 
