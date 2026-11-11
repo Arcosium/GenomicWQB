@@ -35,20 +35,27 @@ def test_percent_metrics_are_parsed_not_zeroed():
 
 # ── 2. turnover 를 바닥(12.5%) 밑으로 낮추면 계속 가산점을 주던 버그 ──────────
 
-def test_turnover_gradient_points_at_high_turnover_band():
-    """**2026-07-21 방향 전환** — 회전율은 이제 낮을수록 좋은 게 아니다.
+def test_turnover_gradient_two_peaks_and_margin_quality_line():
+    """회전율 바닥 추격 금지 + 두 봉우리 + margin 품질선.
 
-    이 테스트는 원래 정반대를 못박고 있었다(`turnover 40% < turnover 3%`). 근거는
-    WQB Fitness 의 분모가 max(turnover, 0.125) 라는 것이었고 그 자체는 지금도 맞다.
-    하지만 제출 규칙이 바뀌면서 **회전율 20% 미만은 고회전 분류를 못 얻고**, 분류를
-    못 얻으면 D0 Sharpe 2.69 / Fitness 1.5 를 정면으로 뚫어야 한다(사실상 불가).
-    그래서 '저회전 최적화' 는 제출 불가능한 알파를 만드는 지시가 됐다.
+    7/21 에는 '고회전 대역(20~70%)이 언제나 저회전보다 높다' 를 못박았다. 8/17 에 표준
+    봉우리(10~15%)가 생겼고, 11/03 에 margin 항이 '리전별 품질선(기본 10bps)에서 포화'
+    로 바뀌었다(중급 스프린트 과제 3·10월 리포트 기준). 그래서 지금은 고회전이 이기려면
+    margin 이 품질선을 넘어야 한다 — 회전율 40%·수익률 5% 는 margin 2.5bps 라 품질 미달이다.
     """
     base = {'sharpe': 1.0, 'fitness': 0.6, 'returns': 0.05}
     kw = dict(pass_count=4, fail_count=4)
     s_3pct = reward.selection_score({**base, 'turnover': 0.03}, **kw)
+    s_12pct = reward.selection_score({**base, 'turnover': 0.12}, **kw)
     s_40pct = reward.selection_score({**base, 'turnover': 0.40}, **kw)
-    assert s_40pct > s_3pct, '고회전 대역(20~70%)이 저회전보다 높아야 한다'
+    # 바닥(12.5%) 밑으로 내려가는 건 보상받지 않는다 — 표준 봉우리가 더 높다.
+    assert s_12pct > s_3pct
+    # margin 품질선 미달이면 고회전이 저회전을 이기지 못한다(11/03 품질 기준).
+    assert s_40pct < s_3pct
+    # 품질선을 넘는 고회전(40%·수익률 21% → margin 10.4bps)은 저회전보다 높다.
+    rich = {**base, 'returns': 0.21}
+    assert (reward.selection_score({**rich, 'turnover': 0.40}, **kw)
+            > reward.selection_score({**rich, 'turnover': 0.03}, **kw))
 
     # 회전율 **항 자체**는 대역 안(20~65%)에서 평평하다 — 불필요한 회전을 유도하지 않는다.
     assert math.isclose(reward._turnover_term(0.40), reward._turnover_term(0.55), rel_tol=1e-9)

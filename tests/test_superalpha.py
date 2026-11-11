@@ -4,38 +4,26 @@ import random
 
 import pytest
 
-from server import criteria, db, superalpha
+from server import db, superalpha
 
 
-def test_selection_expression_embeds_filters_and_seed():
-    s = superalpha.selection_expression(37)
-    assert s.startswith('d = 37;')
-    assert f'(turnover < {criteria.SUPERALPHA_TURNOVER_MAX})' in s
-    assert f'(turnover > {criteria.SUPERALPHA_TURNOVER_MIN})' in s
-    assert 'abs(short_count/long_count-1)' in s
-    assert 'sqrt(turnover+d)*10000' in s          # ACE 의사난수 정렬키
+def test_selection_expression_per_category():
+    s = superalpha.selection_expression('model')
+    assert 'in(datacategories, "model")' in s
+    assert '(2 - self_correlation)' in s          # 기존 알파와 덜 겹치는 순
 
 
-def test_combo_grid_shape():
-    g = superalpha.combo_grid()
-    # stats 5종 × ops 2종 + (-drawdown) × 2 = 12 — ts_ir 은 WQB 가 모르는 연산자(2026-10-31)
-    assert len(g) == 12
-    assert not any('ts_ir' in c for c in g)
-    assert all(c.startswith('stats = generate_stats(alpha);') for c in g)
-    # ts 계열엔 창 126, rank 엔 창 없음.
-    assert any('ts_rank(stats.pnl,126)' in c for c in g)
-    assert any('rank(stats.pnl)' in c and 'ts_' not in c.split(';')[1] for c in g)
-    assert any('-stats.drawdown' in c for c in g)
-
-
-def test_build_candidates_sampling_and_settings():
-    out = superalpha.build_candidates(10, n=5, rng=random.Random(1))
-    assert len(out) == 5
-    sel = out[0]['selection']
-    assert all(c['selection'] == sel for c in out)             # 런당 selection 1개
-    assert len({c['combo'] for c in out}) == 5                 # combo 는 전부 다름
-    st = out[0]['settings']
-    assert st['selectionLimit'] == superalpha.SELECTION_LIMIT
+def test_build_candidates_rotate_categories_on_glb():
+    n = len(superalpha.CATEGORIES)
+    a = superalpha.build_candidates(0, n=3, rng=random.Random(1))
+    b = superalpha.build_candidates(1, n=3)
+    assert [c['category'] for c in a] == list(superalpha.CATEGORIES[:3])
+    assert [c['category'] for c in b] == list(superalpha.CATEGORIES[1:4])   # 날마다 시작점이 돈다
+    assert len({c['selection'] for c in a}) == 3                           # 후보마다 다른 재료
+    assert len(superalpha.build_candidates(n - 1, n=n)) == n               # 끝에서 앞으로 감김
+    st = a[0]['settings']
+    assert (st['region'], st['universe'], st['neutralization']) == ('GLB', 'MINVOL1M', 'COUNTRY')
+    assert st['selectionLimit'] == superalpha.SELECTION_LIMIT >= 10        # WQB 최소 10
     assert st['selectionHandling'] == superalpha.SELECTION_HANDLING
 
 
@@ -148,8 +136,8 @@ def test_run_submits_first_clean_result_once(isolated_db, monkeypatch):
 
 
 def test_descriptions_meet_wqb_minimum():
-    assert len(superalpha.SELECTION_DESCRIPTION) >= 100
-    assert all(len(superalpha.combo_description(c)) >= 100 for c in superalpha.combo_grid())
+    assert all(len(superalpha.selection_description(c)) >= 100 for c in superalpha.CATEGORIES)
+    assert len(superalpha.COMBO_DESCRIPTION) >= 100
 
 
 def test_run_does_not_submit_in_list_mode_or_without_checks(isolated_db, monkeypatch):

@@ -1,9 +1,9 @@
-"""superalpha — OS 알파 풀 위의 슈퍼알파 리서치 경로 (⑤, WQB AAF SuperAlpha 이식).
+"""superalpha — 제출 알파 풀 위의 슈퍼알파 리서치 경로 (⑤).
 
-AAF 레시피 그대로: 필터(롱숏비·turnover·datafield 수·OS 시작일) → 의사난수
-선택(turnover/long_count 를 시드로 쓰는 ACE 트릭 — 특정 위험으로의 쏠림 없이
-복원추출) → combo 그리드(alpha_stats × {rank, ts_rank} × 부호) →
-type=SUPER 시뮬 → **FAIL 0 이면 바로 제출**(런당 1건 성공까지).
+GLB 풀에서 데이터 카테고리별 선택(self_correlation 낮은 순) × combo_a →
+type=SUPER 시뮬 → **FAIL 0 이면 바로 제출**(런당 1건 성공까지). 제출 SELF 검사가
+앞서 낸 슈퍼알파와 겹치는 후보를 거르므로 날마다 다른 카테고리가 나간다.
+(2026-11-11 고급 스프린트 과제 2 — 예전 AAF 의사난수·USA 레시피는 전부 PROD 거절이라 교체.)
 
 2026-10-31 실측: RC 계정에 super simulation 권한이 열려 있다(7/27 엔 NOT_PERMISSIONED).
 슈퍼알파는 제출 한도가 따로다(체크 SUPER_SUBMISSION — REGULAR·PP 월 한도와 별개).
@@ -12,9 +12,8 @@ type=SUPER 시뮬 → **FAIL 0 이면 바로 제출**(런당 1건 성공까지).
 게이트: IQC_SUPERALPHA (기본 1, 0 이면 끔) + RC 계정.
 표현식 생성부는 순수 함수 (run() 만 네트워크/DB).
 
-ponytail: 선택 셋 자체의 PnL 상관검사(원본 노트북의 max_corr<0.5 드롭)는 뺐다 —
-알파당 PnL GET 이 필요해 쿼터가 아깝다. 슈퍼알파 시뮬 결과가 나쁘면 그게 곧
-같은 신호다. 필요해지면 get_alpha_pnl 상관 게이트를 여기 run() 에 추가할 것.
+ponytail: 선택 셋 안의 PnL 상관검사는 뺐다 — 선택식의 self_correlation 정렬과 제출 SELF
+검사로 충분했다(2026-11-11). 필요해지면 get_alpha_pnl 상관 게이트를 run() 에 추가할 것.
 """
 from __future__ import annotations
 
@@ -23,102 +22,78 @@ import random
 import threading
 import time
 
-from . import criteria as _criteria
 from . import db as _db
 
 LOG = logging.getLogger('genomicwqb.superalpha')
 
-SELECTION_LIMIT = 10
-SELECTION_HANDLING = 'NON_NAN'
+SELECTION_LIMIT = 15
+SELECTION_HANDLING = 'POSITIVE'
 # 429 = 동시 시뮬 슬롯이 찼다(라운드 시뮬과 같은 슬롯을 쓴다). 버리지 않고 이만큼 기다린다.
 RATE_LIMIT_WAIT_S = 1200
 
-# combo 그리드 축 (AAF: 이 셋 밖 연산자는 효율이 나빴다고 명시).
-# ts_ir 은 2026-10-31 실측 'inaccessible or unknown operator' — 시뮬 쿼터만 태워서 뺐다.
-COMBO_OPS = ('rank', 'ts_rank')
-COMBO_STATS = ('hold_value', 'short_count/stats.long_count', 'pnl', 'returns',
-               'turnover')
+# GLB 풀(제출 200개)을 데이터 카테고리 등으로 나눠 묶음마다 슈퍼알파 하나 — 재료가 덜 겹쳐
+# 서로 SELF 도 낮다. 2026-11-11 실측(MINVOL1M·COUNTRY·d6·combo_a), 제출 없는 상관 조회:
+#   pv S4.23·PROD 0.63·SELF 0.35 / multi S4.58·0.61·0.41 / model S2.44·0.62·0.47 /
+#   other S4.14·0.69·0.46 — 통과. fundamental 을 self 순으로 고르면 PROD 0.73, risk 는 0.80,
+#   analyst 는 IS_LADDER 1.13, sentiment·news 는 재료 10개 미만으로 실패.
+# 예전 USA 의사난수 선택(풀 36개)은 10/31~11/10 66건 전부 PROD 0.82~0.91 로 거절됐다.
+# 하루 1런이 시드(날짜)만큼 순서를 돌려 시작점을 바꾼다.
+SELECTIONS = {
+    'pv': 'in(datacategories, "pv") * (turnover < 0.3) * (2 - self_correlation)',
+    'multi': '(datacategory_count >= 2) * (turnover < 0.3) * (2 - self_correlation)',
+    'model': 'in(datacategories, "model") * (turnover < 0.3) * (2 - self_correlation)',
+    'other': 'in(datacategories, "other") * (turnover < 0.3) * (2 - self_correlation)',
+    'fundamental': 'in(datacategories, "fundamental") * (turnover < 0.3) * (2 - prod_correlation)',
+}
+CATEGORIES = tuple(SELECTIONS)
+COMBO = 'combo_a(alpha)'
 
 
-def selection_expression(seed_plus: int, *,
-                         datafield_count_max: int = 8,
-                         longshort_bal: float = 0.1,
-                         os_start_date: str = '2023-01-01') -> str:
-    """필터 조건 × 의사난수 정렬키 (ACE 노트북 형식 그대로).
-
-    sqrt(turnover+d)*10000 의 소수부는 d 만 바뀌어도 사실상 난수 — 알파 스탯을
-    시드로 쓰는 복원추출이라 특정 위험 노출로 쏠리지 않는다(AAF Sort-alphas).
-    """
-    turnover_max = _criteria.SUPERALPHA_TURNOVER_MAX
-    conditions = '*'.join([
-        f'(datafield_count < {int(datafield_count_max)})',
-        f'(abs(short_count/long_count-1) < {longshort_bal})',
-        f'(turnover < {turnover_max})',
-        f'(turnover > {_criteria.SUPERALPHA_TURNOVER_MIN})',
-        f'(os_start_date > "{os_start_date}")',
-    ])
-    return (f'd = {int(seed_plus)};\n'
-            f'{conditions}*\n'
-            f'(sqrt(turnover+d)*10000-round(sqrt(turnover+d)*10000)+\n'
-            f'sqrt(long_count+d)*10000-round(sqrt(long_count+d)*10000))')
+def selection_expression(category: str) -> str:
+    """그 묶음의 GLB 알파를 기존 알파(또는 프로덕션)와 덜 겹치는 순으로."""
+    return SELECTIONS[category]
 
 
 # 설명 100자 미만이면 제출 403 (COMBO/SELECTION_DESCRIPTION_LENGTH, 2026-10-31 실측).
-SELECTION_DESCRIPTION = (
-    'Idea: pick up to 10 of my own submitted alphas that are cheap to combine - fewer than 8 '
-    'datafields, balanced long/short books, turnover between 2% and 40%, OS start after '
-    '2023-01-01. Rationale: a pseudo-random sort key seeded by each alpha\'s own stats samples '
-    'the pool without tilting toward one risk factor.')
+def selection_description(category: str) -> str:
+    group = ('that mix two or more data categories' if category == 'multi'
+             else f'that use {category} data')
+    return (f'Idea: combine my submitted GLB alphas {group}, keeping only those with turnover '
+            'below 30%. Rationale: one group per SuperAlpha keeps its components economically '
+            'related while separate SuperAlphas stay uncorrelated; components that overlap '
+            'least with existing alphas are ranked first.')
 
 
-def combo_description(combo: str) -> str:
-    body = str(combo).split(';', 1)[-1].strip()
-    return (f'Idea: weight each selected alpha by {body} computed from its own track record. '
-            'Rationale: components with stronger recent statistics get more weight, while the '
-            'rank transform keeps weights bounded so no single component dominates.')
-
-
-def combo_grid() -> list[str]:
-    """alpha_stats × 연산자 (+ -drawdown 축) — AAF Combine-alphas 그리드."""
-    out = []
-    for stat in COMBO_STATS:
-        for op in COMBO_OPS:
-            win = ',126' if op.startswith('ts') else ''
-            out.append(f'stats = generate_stats(alpha);\n{op}(stats.{stat}{win})')
-    for op in COMBO_OPS:
-        win = ',126' if op.startswith('ts') else ''
-        out.append(f'stats = generate_stats(alpha);\n{op}(-stats.drawdown{win})')
-    return out
+COMBO_DESCRIPTION = (
+    'Idea: combo_a weights each selected alpha by its recent return relative to its volatility '
+    'over the last year. Rationale: components with steadier recent performance get more '
+    'weight, and no fitted parameters are added on top of the selected alphas.')
 
 
 def default_settings() -> dict:
-    """SUPER 시뮬 settings 완성본 (ACE generate_super_alpha 기본값, decay 만 10).
+    """SUPER 시뮬 settings 완성본 — Learn 'Global SuperAlphas' 권장(COUNTRY 중립화·MINVOL1M).
 
-    decay 는 ACE 기본 0 이면 회전율 0.56~0.67 로 슈퍼알파 상한 0.4(HIGH_TURNOVER)를
-    4/4 넘었다. 같은 selection·rank(stats.turnover) 실측(2026-10-31): decay 5 → TO 0.31·
-    S 2.52, decay 10 → TO 0.21·S 2.25, 둘 다 나머지 체크 PASS. 회전율이 더 높은 combo 도
-    상한 안에 들도록 10.
+    decay 0 이면 회전율이 슈퍼알파 상한 0.4 를 넘는다(2026-10-31 USA 실측). GLB d6 은
+    회전율 0.07~0.18(2026-11-11).
     """
     return {
         'nanHandling': 'OFF', 'instrumentType': 'EQUITY', 'delay': 1,
-        'universe': 'TOP3000', 'truncation': 0.08, 'unitHandling': 'VERIFY',
-        'pasteurization': 'ON', 'region': 'USA', 'language': 'FASTEXPR',
-        'decay': 10, 'neutralization': 'INDUSTRY', 'visualization': False,
+        'universe': 'MINVOL1M', 'truncation': 0.08, 'unitHandling': 'VERIFY',
+        'pasteurization': 'ON', 'region': 'GLB', 'language': 'FASTEXPR',
+        'decay': 6, 'neutralization': 'COUNTRY', 'visualization': False,
+        'maxTrade': 'OFF', 'componentActivation': 'IS',
         'selectionHandling': SELECTION_HANDLING,
         'selectionLimit': SELECTION_LIMIT,
     }
 
 
 def build_candidates(seed_plus: int, *, n: int = 6, rng=None) -> list[dict]:
-    """selection 1개 × combo 그리드에서 n 개 표본 → [{selection, combo, settings}]."""
-    sel = selection_expression(seed_plus)
-    combos = combo_grid()
-    if rng is not None and n < len(combos):
-        combos = rng.sample(combos, n)
-    else:
-        combos = combos[:n]
+    """카테고리를 seed 만큼 돌려 n 개 → [{selection, combo, settings, category}]. rng 는 안 쓴다."""
+    k = int(seed_plus) % len(CATEGORIES)
+    cats = (CATEGORIES[k:] + CATEGORIES[:k])[:n]
     st = default_settings()
-    return [{'selection': sel, 'combo': c, 'settings': dict(st)} for c in combos]
+    return [{'selection': selection_expression(c), 'combo': COMBO, 'settings': dict(st),
+             'category': c} for c in cats]
 
 
 def run(user_id: int, username: str, password: str, *,
@@ -191,8 +166,9 @@ def run(user_id: int, username: str, password: str, *,
                 # 제출 방식이 '목록에 추가'(list)면 자동 제출하지 않는다 — 큐 드레인과 같은 규칙.
                 if (st.get('pass') and not fails and not submitted
                         and _db.get_submit_mode(user_id) != 'list'):
-                    client.set_super_description(alpha_id, SELECTION_DESCRIPTION,
-                                                 combo_description(c['combo']))
+                    client.set_super_description(alpha_id,
+                                                 selection_description(c['category']),
+                                                 COMBO_DESCRIPTION)
                     ok, msg = client.submit_alpha(alpha_id, stop_event=stop_event,
                                                   deadline_s=600)
                     entry['submit'] = {'ok': bool(ok), 'status': str(msg or '')[:300]}

@@ -1390,9 +1390,11 @@ class BaseGenomeModel:
 
         out: list[dict] = []
         seen: set[str] = set()
-        if self.parent is not None:
-            # 부모 그대로(무변이) 재출현 방지 — 이미 시뮬한 조합.
-            seen.add(self._dedup_key(self.parent))
+        # 부모 그대로(무변이) 재출현 방지 — 이미 시뮬한 조합. 시드 부모도 막는다:
+        # 변이가 _constrain 에 되돌려지면 시드와 똑같은 자식(바뀐 유전자 0개)이 시뮬 한
+        # 칸을 버렸다(2026-11-11, test_exploit_generation_changes_at_most_two_axes).
+        for g0 in ([self.parent] if self.parent is not None else []) + self.seeds:
+            seen.add(self._dedup_key(g0))
         i = 0
         slot_attempts = 0
         last_slot = -1
