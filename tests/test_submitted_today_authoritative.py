@@ -72,3 +72,13 @@ def test_platform_date_matches_the_submission_day_boundary():
     assert db.platform_date(ts) == db.platform_date(ts + 3600)
     assert db.platform_date(ts - 60) != db.platform_date(ts)
     datetime.date.fromisoformat(db.platform_date())   # 형식 검증
+
+
+def test_superalpha_submissions_are_not_regular_budget(wk, monkeypatch):
+    """WQB 총계는 슈퍼알파도 센다(일반 3 + 슈퍼 1 = 4) — 슈퍼는 한도가 따로라 일반 칸 하나가 남아야 한다."""
+    for i in range(3):
+        db.record_submit_attempt(wk.user_id, 1, i, 'rank(close)', True, 'submitted')
+    rid = db.superalpha_start(wk.user_id, 1, 'sel')
+    db.superalpha_finish(rid, 'done', [{'alpha_id': 'S1', 'submit': {'ok': True}}])
+    _remote(monkeypatch, 4)
+    assert wk._submitted_today() == 3

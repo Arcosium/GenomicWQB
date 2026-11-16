@@ -96,6 +96,50 @@ def build_candidates(seed_plus: int, *, n: int = 6, rng=None) -> list[dict]:
              'category': c} for c in cats]
 
 
+def drain_queue(client, user_id: int, log, stop_event=None) -> dict | None:
+    """쌓아 둔 슈퍼알파(submit_queue kind='super')를 시뮬 없이 먼저 낸다 (2026-11-16 인계).
+
+    고급 스프린트 탐색 루프가 IS 를 통과시켜 둔 후보를 id 순으로 낸다. metrics 의
+    sel_desc·combo_desc 를 설명으로 붙인다. → 오늘 칸을 다 쓴 결과 dict(성공·한도·판정
+    불확실) 또는 None(큐가 비어 새 시뮬 런으로 넘어간다). 확정 거절은 skipped 로 내리고 다음 행.
+    """
+    while not (stop_event is not None and stop_event.is_set()):
+        row = _db.submit_queue_next_pending(user_id, kind='super')
+        if row is None:
+            return None
+        qid, wid, m = int(row['id']), str(row['wqb_alpha_id']), row.get('metrics') or {}
+        _db.submit_queue_mark(qid, 'submitting', '자동 제출 진행 중…')
+        try:
+            # 설명 PATCH 실패는 429·5xx 일 수 있다 — 버리지 않고 아래 '판정 없음'으로 오늘 멈춘다.
+            ok, msg = (client.submit_alpha(wid, stop_event=stop_event, deadline_s=1200)
+                       if client.set_super_description(wid, str(m.get('sel_desc') or ''),
+                                                       str(m.get('combo_desc') or ''))
+                       else (False, '설명 PATCH 실패'))
+        except Exception as e:
+            _db.submit_queue_mark(qid, 'pending', f'예외: {str(e)[:120]} — 내일 다시')
+            raise
+        msg = str(msg or '')
+        entry = {'alpha_id': wid, 'queued': True, 'submit': {'ok': bool(ok), 'status': msg[:300]}}
+        if ok and '이미 제출됨' in msg:
+            # 앞서 시간 초과로 끝난 제출이 실제로는 들어갔던 것 — 그게 오늘 칸인지 모르니 다음 행을
+            # 낸다. 칸이 찼으면 SUPER_SUBMISSION 한도 거절로 아래에서 멈춘다.
+            _db.submit_queue_delete(user_id, [qid])
+            log(f'  ✔ 대기 슈퍼알파 {wid} — 이미 제출돼 있었음, 다음 후보로')
+            continue
+        if ok:
+            _db.submit_queue_delete(user_id, [qid])
+            log(f'  🚀 대기 슈퍼알파 제출 성공 — {wid}')
+            return entry
+        if 'SUBMISSION(' in msg or not msg.startswith('rejected:'):
+            # SUPER_SUBMISSION 하루 한도, 또는 시간 초과·오류(판정 없음) — 내일 같은 행부터.
+            _db.submit_queue_mark(qid, 'pending', f'오늘 중단: {msg[:150]}')
+            log(f'  ⏳ 대기 슈퍼알파 {wid} — {msg[:120]} → 내일 다시')
+            return entry
+        _db.submit_queue_mark(qid, 'skipped', msg[:200])
+        log(f'  ⛔ 대기 슈퍼알파 {wid}: {msg[:160]}')
+    return {'stopped': True}
+
+
 def run(user_id: int, username: str, password: str, *,
         seed_plus: int = 10, n: int = 6, rng=None,
         stop_event=None, log_fn=None) -> int | None:
@@ -121,6 +165,11 @@ def run(user_id: int, username: str, password: str, *,
         if not client.authenticate():
             _db.superalpha_finish(run_id, 'error', results, 'WQB 인증 실패')
             return run_id
+        if _db.get_submit_mode(user_id) != 'list':
+            queued = drain_queue(client, user_id, log, stop_event)
+            if queued is not None:
+                _db.superalpha_finish(run_id, 'done', [queued])
+                return run_id
         for c in cands:
             if stop_event is not None and stop_event.is_set():
                 break

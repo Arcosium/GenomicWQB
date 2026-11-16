@@ -204,6 +204,15 @@ def _quarter_submitted_fields(user_id: int) -> set:
     return seen
 
 
+def _supers_submitted_since(user_id: int, ts: float) -> int:
+    """ts 뒤 시작한 슈퍼알파 런에서 제출 성공한 수 (superalpha_runs 기록). 조회 실패면 0."""
+    try:
+        return sum(1 for r in _db.superalpha_runs_list(user_id, limit=20) if float(r['ts']) >= ts
+                   for e in r.get('results') or [] if (e.get('submit') or {}).get('ok'))
+    except Exception:
+        return 0
+
+
 def _datasets_used_by_code(code: str) -> set[str]:
     """로컬 필드 카탈로그로 확인 가능한 dataset.id 집합.
 
@@ -534,7 +543,7 @@ class Worker(threading.Thread):
 
     # ── 일일 제출 예산 ────────────────────────────────────────────
     def _submit_gate(self, metrics: dict, self_corr=None, fail_items=None,
-                     genome=None, code=None) -> tuple[bool, str]:
+                     genome=None, code=None, vetted: bool = False) -> tuple[bool, str]:
         """제출할까? (ok, 사유) — wqb_backend 가 **제출 락 안에서** 호출한다.
 
         WQB 컨설턴트의 제출 한도는 **하루 4건**이다("Max 4 alpha submissions in a day",
@@ -566,7 +575,10 @@ class Worker(threading.Thread):
         #    여기서 두 번 걸 이유가 없다.
         #    ⚠ scope(region/delay/universe)와 금지 데이터셋은 그대로 막는다 — 그건
         #      조건을 어기는 것이라 WQB 가 어차피 거절한다.
-        constraint_reasons = _constraint_gate_reasons(
+        # vetted = 사람이 따로 골라 넣은 대기 행(metrics.vetted, 2026-11-16 고급 스프린트 EUR
+        #   후보 인계). 워커 탐색 조건(GLB 테마)과 무관한 일반 제출이라 범위·PP 월 한도 문은
+        #   건너뛴다. 하한 샤프·목록 모드·보류창·하루 예산은 그대로 지킨다.
+        constraint_reasons = [] if vetted else _constraint_gate_reasons(
             active_constraint, metrics or {}, str(code or ''), waive_checks=True)
         if constraint_reasons:
             return False, 'active_constraint(' + '; '.join(constraint_reasons) + ')'
@@ -584,7 +596,7 @@ class Worker(threading.Thread):
         #    나오기 시작했다. 그달엔 PP 완화선(샤프 1.0)으로는 안 나가므로 표준·HT 컷 미달은
         #    보내지 않는다(거절 한 건이 제출 슬롯을 몇 분씩 붙잡아 그날 시도 370건이 0건).
         #    다음 달 1일(동부시간)이면 조회 범위가 바뀌어 저절로 풀린다.
-        if _pp_month_closed(self.user_id) and max(
+        if not vetted and _pp_month_closed(self.user_id) and max(
                 _criteria.standard_progress(metrics or {}),
                 _criteria.ht_progress(metrics or {})) < 1.0:
             return False, 'pp_month_closed(regular_cut_miss)'
@@ -860,6 +872,10 @@ class Worker(threading.Thread):
             return local
         if remote is None:
             return local
+        # WQB activities 총계는 슈퍼알파도 센다(11/11~16 날마다 일반 4 + 슈퍼 1 = 5). 슈퍼는 한도가
+        # 따로라 우리가 낸 오늘 슈퍼 수만큼 뺀다. ponytail: BRAIN UI 로 직접 낸 슈퍼는 못 빼
+        # 일반 칸을 하나 덜 쓰는 쪽으로만 틀린다.
+        remote = max(0, int(remote) - _supers_submitted_since(self.user_id, _db.day_start_ts()))
         self._sub_cnt_cache = (today, time.time(), int(remote))
         if remote > local:
             self._log_quiet(
@@ -984,7 +1000,8 @@ class Worker(threading.Thread):
         wid = str(row.get('wqb_alpha_id') or '')
         ok_gate, reason = self._submit_gate(row.get('metrics') or {}, None,
                                             fail_items=[], genome=None,
-                                            code=str(row.get('code') or ''))
+                                            code=str(row.get('code') or ''),
+                                            vetted=bool((row.get('metrics') or {}).get('vetted')))
         if not ok_gate:
             if reason.startswith('daily_budget'):
                 return None          # 예산이 닫혔다 — 이번 판은 더 볼 것이 없다
@@ -1119,7 +1136,8 @@ class Worker(threading.Thread):
         # 재시작으로 중단된 선점('submitting')은 이 프로세스엔 주인이 없다 — 되돌린다.
         # (부팅 직후라 수동 제출이 진행 중일 수 없어 안전하다)
         try:
-            for _r in _db.submit_queue_list(self.user_id, limit=200):
+            # 큐가 수천 행이라(11/16 EUR·슈퍼알파 인계) 최신 200 행만 보면 오래된 선점이 남는다.
+            for _r in _db.submit_queue_list(self.user_id, limit=100000):
                 if _r.get('status') == 'submitting':
                     _db.submit_queue_mark(_r['id'], 'pending', '재시작으로 중단 — 재시도 대기')
         except Exception as e:

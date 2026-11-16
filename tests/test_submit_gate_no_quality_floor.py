@@ -96,6 +96,9 @@ def test_active_scope_mismatch_is_blocked_before_submit(wk):
     metrics = dict(_WEAK, region='USA', _delay='1', universe='TOP3000')
     ok, reason = wk._submit_gate(metrics, None, fail_items=[], code='rank(opt6_vimtaxp)')
     assert ok is False and 'region=USA' in reason and 'delay=1' in reason
+    # 사람이 골라 넣은 대기 행(vetted)은 탐색 조건과 무관한 일반 제출이라 범위 문을 건너뛴다.
+    ok, reason = wk._submit_gate(metrics, None, fail_items=[], code='', vetted=True)
+    assert ok is True, reason
 
 
 def test_below_wqb_min_sharpe_is_neither_submitted_nor_queued(wk):

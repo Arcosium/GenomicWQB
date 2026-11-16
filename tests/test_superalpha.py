@@ -158,3 +158,89 @@ def test_run_does_not_submit_in_list_mode_or_without_checks(isolated_db, monkeyp
     monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
     superalpha.run(uid, 'u', 'p', seed_plus=10, n=2)
     assert fake.submitted == [], '판정 불가(PASS 0) 결과를 냈다'
+
+
+# ── 대기 슈퍼알파 먼저 (2026-11-16 고급 스프린트 인계) ─────────────────────────
+
+class _QueueClient(_FakeClient):
+    """대기 행 제출 결과를 차례로 돌려준다. 시뮬을 부르면 센다(불리면 안 된다)."""
+
+    def __init__(self, results):
+        super().__init__()
+        self.results = list(results)
+        self.descs = {}
+
+    def set_super_description(self, aid, selection, combo):
+        self.descs[aid] = (selection, combo)
+        self.described = aid
+        return True
+
+    def submit_alpha(self, aid, stop_event=None, deadline_s=None):
+        self.submitted.append(aid)
+        return self.results.pop(0)
+
+
+def _queue(uid, *wids):
+    for w_ in wids:
+        db.submit_queue_add(uid, wqb_alpha_id=w_, kind='super',
+                            metrics={'sel_desc': f'sel {w_}', 'combo_desc': f'combo {w_}'})
+
+
+def test_run_submits_queued_superalpha_before_simulating(isolated_db, monkeypatch):
+    uid = isolated_db
+    import server.wqb_api as wqb_api
+    _queue(uid, 'Q1', 'Q2', 'Q3')
+    fake = _QueueClient([(False, 'rejected:PROD_CORRELATION(0.88 vs 0.7) (http_403)'),
+                         (True, 'submitted')])
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+    assert fake.submitted == ['Q1', 'Q2'] and fake.sim_calls == 0, '대기 행이 있는데 새로 시뮬했다'
+    assert fake.descs['Q2'] == ('sel Q2', 'combo Q2'), '저장한 설명을 안 붙였다'
+    left = {r['wqb_alpha_id']: r['status'] for r in db.submit_queue_list(uid, include_skipped=True)}
+    assert left == {'Q1': 'skipped', 'Q3': 'pending'}   # 성공 Q2 는 내려가고 Q3 은 내일
+
+
+def test_queued_superalpha_quota_or_timeout_waits_for_tomorrow(isolated_db, monkeypatch):
+    uid = isolated_db
+    import server.wqb_api as wqb_api
+    _queue(uid, 'Q1', 'Q2')
+    for msg in ('rejected:SUPER_SUBMISSION(1 vs 1) (http_403)', 'pending_timeout'):
+        fake = _QueueClient([(False, msg)])
+        monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+        superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+        assert fake.submitted == ['Q1'] and fake.sim_calls == 0
+        st = {r['wqb_alpha_id']: r['status'] for r in db.submit_queue_list(uid)}
+        assert st == {'Q1': 'pending', 'Q2': 'pending'}, msg
+
+
+def test_queued_superalpha_transient_failures_keep_the_row(isolated_db, monkeypatch):
+    """설명 PATCH 실패(429·5xx 일 수 있다)나 예외는 후보를 버리지도 잠그지도 않는다 — 내일 같은 행부터."""
+    uid = isolated_db
+    import server.wqb_api as wqb_api
+    _queue(uid, 'Q1', 'Q2')
+    fake = _QueueClient([])
+    fake.set_super_description = lambda aid, s, c: False
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+    assert fake.submitted == [] and fake.sim_calls == 0
+
+    def boom(aid, stop_event=None, deadline_s=None):
+        raise RuntimeError('net')
+    fake = _QueueClient([])
+    fake.submit_alpha = boom
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+    st = {r['wqb_alpha_id']: r['status'] for r in db.submit_queue_list(uid)}
+    assert st == {'Q1': 'pending', 'Q2': 'pending'}
+
+
+def test_already_submitted_queued_superalpha_moves_on(isolated_db, monkeypatch):
+    """전날 시간 초과가 실제로 들어갔던 행은 내리고 다음 후보를 낸다(칸이 찼으면 한도 거절로 멈춘다)."""
+    uid = isolated_db
+    import server.wqb_api as wqb_api
+    _queue(uid, 'Q1', 'Q2')
+    fake = _QueueClient([(True, 'submitted (이미 제출됨 — stage=OS 확인)'), (True, 'submitted')])
+    monkeypatch.setattr(wqb_api, 'WqbApiClient', lambda u, p: fake)
+    superalpha.run(uid, 'u', 'p', seed_plus=10, n=3)
+    assert fake.submitted == ['Q1', 'Q2'] and db.submit_queue_list(uid) == []
